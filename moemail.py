@@ -1,4 +1,4 @@
-"""Mail helpers (MoeMail / YYDS / GPTMail) + proxy normalization for protocol registration.
+"""Mail helpers and proxy normalization for protocol registration.
 
 Kept intentionally small: only the pieces used by ``grok_build_adapter``
 (and optional admin proxy smoke tests). The legacy full-session
@@ -9,12 +9,14 @@ Providers:
   - yyds     — vip.215.im / maliapi.215.im YYDS Mail (``/v1/accounts`` …)
   - gptmail  — mail.chatgpt.org.uk GPTMail (``/api/generate-email`` …)
   - cfmail   — dreamhunter2333/cloudflare_temp_email (``/api/new_address`` …)
+  - inbucket — self-hosted Inbucket (``/api/v1/mailbox/...``)
 """
 from __future__ import annotations
 
 import email
 import random
 import re
+import secrets
 from email import policy
 from typing import Any
 from urllib.parse import quote, unquote, urlparse, urlunparse
@@ -53,7 +55,7 @@ def _headers(api_key: str | None = None) -> dict[str, str]:
 
 
 def normalize_mail_provider(provider: str | None, *, base_url: str | None = None) -> str:
-    """Return ``moemail`` | ``yyds`` | ``gptmail`` | ``cfmail``.
+    """Return a supported protocol-registration mail provider.
 
     Infer from base_url when provider is empty.
     """
@@ -82,6 +84,8 @@ def normalize_mail_provider(provider: str | None, *, base_url: str | None = None
         "awsl",
     }:
         return "cfmail"
+    if p in {"inbucket", "in-bucket", "in_bucket"}:
+        return "inbucket"
     if p in {"moemail", "moe", "moe-mail"}:
         return "moemail"
     base = (base_url or "").strip().lower()
@@ -108,6 +112,8 @@ def normalize_mail_provider(provider: str | None, *, base_url: str | None = None
         )
     ):
         return "cfmail"
+    if "inbucket" in base:
+        return "inbucket"
     return "moemail"
 
 
@@ -156,6 +162,20 @@ def normalize_cfmail_base_url(base_url: str | None = None) -> str:
     if not parsed.netloc:
         return CFMAIL_DEFAULT_BASE_URL
     return origin or CFMAIL_DEFAULT_BASE_URL
+
+
+def normalize_inbucket_base_url(base_url: str | None = None) -> str:
+    """Normalize an Inbucket host while keeping an empty value unconfigured."""
+    raw = (base_url or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw if "://" in raw else f"http://{raw}")
+    if not parsed.netloc:
+        return ""
+    path = (parsed.path or "").rstrip("/")
+    return urlunparse(
+        (parsed.scheme or "http", parsed.netloc, path, "", "", "")
+    ).rstrip("/")
 
 
 def _cfmail_headers(
@@ -218,16 +238,20 @@ def normalize_proxy_config(
         port = parsed.port
     except ValueError as e:
         raise ValueError("proxy port is invalid") from e
-    proxy_user = (username if username is not None else "").strip()
-    proxy_pass = (password if password is not None else "").strip()
+    if port is None:
+        raise ValueError("proxy must include host and port")
+    # The standard URL is authoritative. Legacy split fields are used only when
+    # the URL itself has no corresponding credential.
+    proxy_user = unquote(parsed.username) if parsed.username else ""
+    proxy_pass = unquote(parsed.password) if parsed.password else ""
+    if not proxy_user and username is not None:
+        proxy_user = username.strip()
+    if not proxy_pass and password is not None:
+        proxy_pass = password.strip()
     if not proxy_user and username is None:
         proxy_user = env_user
     if not proxy_pass and password is None:
         proxy_pass = env_pass
-    if not proxy_user and parsed.username:
-        proxy_user = unquote(parsed.username)
-    if not proxy_pass and parsed.password:
-        proxy_pass = unquote(parsed.password)
 
     if proxy_pass and not proxy_user:
         raise ValueError("proxy username is required when proxy password is set")
@@ -1301,6 +1325,121 @@ def cfmail_fetch_messages(
         return out
 
 
+def inbucket_create_mailbox(
+    *,
+    name: str | None = None,
+    domain: str | None = None,
+    expiry_ms: int | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    proxy: str | None = None,
+    proxy_username: str | None = None,
+    proxy_password: str | None = None,
+) -> dict[str, Any]:
+    """Compose an Inbucket address; Inbucket creates mailboxes on delivery."""
+    base = normalize_inbucket_base_url(base_url)
+    if not base:
+        raise ValueError("Inbucket Base URL missing")
+    dom = (domain or "").strip().lstrip("@").strip(".")
+    if not dom:
+        raise ValueError("Inbucket domain missing")
+    local_part = (name or secrets.token_hex(5)).strip().lower()
+    local_part = re.sub(r"[^a-z0-9._-]+", "", local_part)
+    if not local_part:
+        raise ValueError("Inbucket mailbox name is invalid")
+    address = f"{local_part}@{dom}"
+    return {
+        "id": local_part,
+        "email": address,
+        "token": "",
+        "provider": "inbucket",
+        "raw": {"mailbox_name": local_part, "base_url": base},
+        "expiry_ms": expiry_ms,
+    }
+
+
+def inbucket_fetch_messages(
+    email_id: str,
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    include_details: bool = True,
+    address: str | None = None,
+    token: str | None = None,
+) -> list[dict[str, Any]]:
+    """Read and normalize messages from the Inbucket v1 REST API."""
+    base = normalize_inbucket_base_url(base_url)
+    if not base:
+        raise ValueError("Inbucket Base URL missing")
+    mailbox_name = str(email_id or "").strip()
+    if "@" in mailbox_name:
+        mailbox_name = mailbox_name.split("@", 1)[0]
+    if not mailbox_name and address:
+        mailbox_name = str(address).split("@", 1)[0].strip()
+    if not mailbox_name:
+        raise ValueError("Inbucket mailbox name missing")
+    headers = {"Accept": "application/json"}
+    key = (api_key or "").strip()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    mailbox_path = quote(mailbox_name, safe="")
+
+    with httpx.Client(timeout=30.0, headers=headers) as client:
+        resp = client.get(f"{base}/api/v1/mailbox/{mailbox_path}")
+        if resp.status_code >= 400:
+            raise RuntimeError(
+                f"Inbucket list failed {resp.status_code}: {resp.text[:500]}"
+            )
+        data = resp.json() if resp.content else []
+        if isinstance(data, dict):
+            messages = data.get("messages") or data.get("items") or []
+        else:
+            messages = data
+        if not isinstance(messages, list):
+            return []
+
+        out: list[dict[str, Any]] = []
+        for raw in messages[:20]:
+            if not isinstance(raw, dict):
+                continue
+            item = dict(raw)
+            msg_id = str(item.get("id") or item.get("message_id") or "").strip()
+            detail: dict[str, Any] = item
+            if include_details and msg_id:
+                detail_resp = client.get(
+                    f"{base}/api/v1/mailbox/{mailbox_path}/{quote(msg_id, safe='')}"
+                )
+                if detail_resp.status_code >= 400:
+                    raise RuntimeError(
+                        f"Inbucket detail failed {detail_resp.status_code}: "
+                        f"{detail_resp.text[:500]}"
+                    )
+                parsed = detail_resp.json() if detail_resp.content else {}
+                if isinstance(parsed, dict):
+                    detail = parsed
+            body = detail.get("body") if isinstance(detail.get("body"), dict) else {}
+            header = detail.get("header") if isinstance(detail.get("header"), dict) else {}
+            normalized = dict(item)
+            normalized.update(
+                {
+                    "id": msg_id,
+                    "subject": detail.get("subject") or item.get("subject") or "",
+                    "from": detail.get("from") or item.get("from") or "",
+                    "to": header.get("To") or detail.get("to") or item.get("to") or "",
+                    "text": body.get("text") or detail.get("text") or "",
+                    "html": body.get("html") or detail.get("html") or "",
+                    "raw": detail,
+                }
+            )
+            text = "\n".join(
+                str(normalized.get(k) or "")
+                for k in ("subject", "text", "html", "from", "to")
+            )
+            normalized["extracted"] = _extract_codes_and_links(text)
+            out.append(normalized)
+        return out
+
+
 def create_mailbox(
     *,
     provider: str | None = None,
@@ -1313,7 +1452,7 @@ def create_mailbox(
     proxy_username: str | None = None,
     proxy_password: str | None = None,
 ) -> dict[str, Any]:
-    """Provider-aware mailbox create (``moemail`` | ``yyds`` | ``gptmail`` | ``cfmail``)."""
+    """Create a mailbox using the selected provider."""
     prov = normalize_mail_provider(provider, base_url=base_url)
     if prov == "yyds":
         return yyds_create_mailbox(
@@ -1339,6 +1478,17 @@ def create_mailbox(
         )
     if prov == "cfmail":
         return cfmail_create_mailbox(
+            name=name,
+            domain=domain,
+            expiry_ms=expiry_ms,
+            api_key=api_key,
+            base_url=base_url,
+            proxy=proxy,
+            proxy_username=proxy_username,
+            proxy_password=proxy_password,
+        )
+    if prov == "inbucket":
+        return inbucket_create_mailbox(
             name=name,
             domain=domain,
             expiry_ms=expiry_ms,
@@ -1395,6 +1545,15 @@ def fetch_messages(
         )
     if prov == "cfmail":
         return cfmail_fetch_messages(
+            email_id,
+            api_key=api_key,
+            base_url=base_url,
+            include_details=include_details,
+            address=address,
+            token=token,
+        )
+    if prov == "inbucket":
+        return inbucket_fetch_messages(
             email_id,
             api_key=api_key,
             base_url=base_url,

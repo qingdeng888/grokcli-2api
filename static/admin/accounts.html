@@ -269,7 +269,7 @@
   <div class="g2a-card-head">
     <div>
       <h3>协议注册</h3>
-      <p>临时邮箱（MoeMail / YYDS）+ 过盾服务自动建号并导入账号池。本地过盾以内联方式运行（无需填写 URL）；也可切换到 YesCaptcha 云端。</p>
+      <p>临时邮箱（含自托管 Inbucket）+ 过盾服务自动建号并导入账号池。本地过盾以内联方式运行；也可切换到 YesCaptcha 云端。</p>
     </div>
     <div class="g2a-actions">
       <button class="g2a-btn g2a-btn-default" id="btn-save-reg">保存配置</button>
@@ -279,7 +279,28 @@
       <button class="g2a-btn g2a-btn-default" id="btn-refresh-reg">刷新进度</button>
     </div>
   </div>
+  <div class="g2a-subcard" style="margin-bottom:12px">
+    <div class="g2a-card-head" style="margin-bottom:8px">
+      <div>
+        <strong>邮箱接口池</strong>
+        <p class="g2a-muted" style="margin:4px 0 0">可添加多个邮箱 API；批量注册会在启用接口及其域名之间轮换。</p>
+      </div>
+      <div class="g2a-actions">
+        <span id="reg-mail-pool-summary" class="g2a-tag">—</span>
+        <button type="button" class="g2a-btn g2a-btn-default g2a-btn-sm" id="btn-add-reg-mail">添加接口</button>
+        <button type="button" class="g2a-btn g2a-btn-danger g2a-btn-sm" id="btn-delete-reg-mail">删除当前</button>
+      </div>
+    </div>
+    <div id="reg-mail-provider-list" class="g2a-actions" style="flex-wrap:wrap"></div>
+  </div>
   <div class="g2a-form-grid">
+    <div class="g2a-field">
+      <label for="reg-mail-label">接口名称</label>
+      <input id="reg-mail-label" placeholder="例如 Inbucket-主站" maxlength="80" />
+    </div>
+    <div class="g2a-field">
+      <label class="g2a-check" style="margin-top:28px"><input type="checkbox" id="reg-mail-enabled" checked /> 启用此邮箱接口</label>
+    </div>
     <div class="g2a-field">
       <label for="reg-mail-provider">邮箱服务</label>
       <select id="reg-mail-provider">
@@ -287,6 +308,7 @@
         <option value="yyds">YYDS Mail（vip.215.im）</option>
         <option value="gptmail">GPTMail（mail.chatgpt.org.uk）</option>
         <option value="cfmail">Cloudflare Temp Email</option>
+        <option value="inbucket">Inbucket（自托管）</option>
       </select>
     </div>
     <div class="g2a-field" id="reg-base-url-wrap">
@@ -298,8 +320,8 @@
       <input id="reg-api-key" placeholder="按服务填写，各自独立保存" autocomplete="off" name="reg-api-key" />
     </div>
     <div class="g2a-field">
-      <label id="reg-domain-label">邮箱域名</label>
-      <input id="reg-domain" placeholder="留空则自动获取（YYDS/GPTMail/CF）" autocomplete="off" name="reg-domain" spellcheck="false" />
+      <label id="reg-domain-label">邮箱域名（每行一个）</label>
+      <textarea id="reg-domain" class="g2a-input" rows="3" placeholder="每行一个；留空则由服务自动获取" autocomplete="off" name="reg-domain" spellcheck="false"></textarea>
     </div>
     <div class="g2a-field">
       <label for="reg-captcha-provider">过盾方式</label>
@@ -328,9 +350,10 @@
         <option value="0">永久</option>
       </select>
     </div>
-    <div class="g2a-field"><label>代理</label><input id="reg-proxy" placeholder="可选 http://..." /></div>
-    <div class="g2a-field"><label>代理用户名</label><input id="reg-proxy-username" /></div>
-    <div class="g2a-field"><label>代理密码</label><input id="reg-proxy-password" type="password" /></div>
+    <div class="g2a-field">
+      <label title="支持 HTTP/HTTPS/SOCKS5；认证信息直接写在 URL 中">代理 URL</label>
+      <input id="reg-proxy" placeholder="socks5://user:password@127.0.0.1:1080" autocomplete="off" />
+    </div>
   </div>
   <div id="reg-session-box" class="g2a-subcard hidden" style="margin-top:12px" hidden>
     <div class="g2a-kv"><span>状态</span><span id="reg-status" class="g2a-tag">idle</span></div>
@@ -432,6 +455,6 @@
   <script src="/static/dist/api.b6d8a65a8a.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.4835665ff4.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.ece4919644.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.0739197f2a.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

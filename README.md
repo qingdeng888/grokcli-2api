@@ -384,6 +384,8 @@ docker-compose.yml                    # redis + postgres（内网）+ app（内�
 ## 版本
 
 - **v1.9.47**（当前）：
+  - 协议注册新增 **Inbucket** 自托管临时邮箱支持（Base URL + 域名，API Key 可选）
+  - 注册代理统一使用标准 URL，支持 HTTP/HTTPS/SOCKS5、认证与无认证代理
   - **空闲降内存**：内联 Turnstile 浏览器池默认懒加载（`TURNSTILE_LAZY=1`），首次过盾再 warm
   - **空闲回收**：`TURNSTILE_IDLE_SEC`（默认 180s）无验证码活动后关闭 Camoufox，避免空转占 1G+
   - 默认 `GROK2API_WORKERS` 调为 **2**（可用环境变量覆盖）；显式允许 `1`

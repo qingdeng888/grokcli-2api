@@ -186,13 +186,18 @@ class EmailRegistrationBody(BaseModel):
     # Backward-compat: older clients sent provider=moemail for the mail service.
     provider: str | None = Field(
         default=None,
-        pattern="^(moemail|yyds|gptmail|cfmail)$",
+        pattern="^(moemail|yyds|gptmail|cfmail|inbucket)$",
         description="Deprecated alias of mail_provider",
     )
     mail_provider: str | None = Field(
         default=None,
-        pattern="^(moemail|yyds|gptmail|cfmail)$",
-        description="Temp-mail: moemail | yyds | gptmail | cfmail (cloudflare_temp_email)",
+        pattern="^(moemail|yyds|gptmail|cfmail|inbucket)$",
+        description="Temp-mail: moemail | yyds | gptmail | cfmail | inbucket",
+    )
+    mail_providers: list[dict[str, Any]] | None = Field(
+        default=None,
+        max_length=50,
+        description="Enabled mail API instances used by batch registration",
     )
     protocol: str = Field(default="grpc", pattern="^grpc$")
     email: str | None = Field(default=None, max_length=256)
@@ -210,10 +215,12 @@ class EmailRegistrationBody(BaseModel):
     yyds_api_key: str | None = Field(default=None, max_length=512)
     gptmail_api_key: str | None = Field(default=None, max_length=512)
     cfmail_api_key: str | None = Field(default=None, max_length=512)
+    inbucket_api_key: str | None = Field(default=None, max_length=512)
     moemail_domain: str | None = Field(default=None, max_length=128)
     yyds_domain: str | None = Field(default=None, max_length=128)
     gptmail_domain: str | None = Field(default=None, max_length=128)
     cfmail_domain: str | None = Field(default=None, max_length=128)
+    inbucket_domain: str | None = Field(default=None, max_length=128)
     captcha_provider: str | None = Field(
         default=None,
         pattern="^(local|yescaptcha)$",
@@ -228,8 +235,11 @@ class EmailRegistrationBody(BaseModel):
     base_url: str | None = Field(
         default=None,
         max_length=256,
-        description="MoeMail only; YYDS/GPTMail use fixed hosts",
+        description="Active self-hosted mail provider Base URL",
     )
+    moemail_base_url: str | None = Field(default=None, max_length=256)
+    cfmail_base_url: str | None = Field(default=None, max_length=256)
+    inbucket_base_url: str | None = Field(default=None, max_length=256)
     proxy: str | None = Field(default=None, max_length=512)
     proxy_username: str | None = Field(default=None, max_length=256)
     proxy_password: str | None = Field(default=None, max_length=512)
@@ -270,14 +280,22 @@ class RegistrationConfigBody(BaseModel):
 
     mail_provider: str | None = Field(
         default=None,
-        pattern="^(moemail|yyds|gptmail|cfmail)$",
-        description="Temp-mail: moemail | yyds | gptmail | cfmail (cloudflare_temp_email)",
+        pattern="^(moemail|yyds|gptmail|cfmail|inbucket)$",
+        description="Temp-mail: moemail | yyds | gptmail | cfmail | inbucket",
+    )
+    mail_providers: list[dict[str, Any]] | None = Field(
+        default=None,
+        max_length=50,
+        description="Independent mail API instances with per-entry domains",
     )
     base_url: str | None = Field(
         default=None,
         max_length=256,
-        description="MoeMail only; YYDS/GPTMail ignore this (fixed hosts)",
+        description="Active self-hosted mail provider Base URL",
     )
+    moemail_base_url: str | None = Field(default=None, max_length=256)
+    cfmail_base_url: str | None = Field(default=None, max_length=256)
+    inbucket_base_url: str | None = Field(default=None, max_length=256)
     api_key: str | None = Field(
         default=None,
         max_length=512,
@@ -286,6 +304,8 @@ class RegistrationConfigBody(BaseModel):
     moemail_api_key: str | None = Field(default=None, max_length=512)
     yyds_api_key: str | None = Field(default=None, max_length=512)
     gptmail_api_key: str | None = Field(default=None, max_length=512)
+    cfmail_api_key: str | None = Field(default=None, max_length=512)
+    inbucket_api_key: str | None = Field(default=None, max_length=512)
     domain: str | None = Field(
         default=None,
         max_length=128,
@@ -294,6 +314,8 @@ class RegistrationConfigBody(BaseModel):
     moemail_domain: str | None = Field(default=None, max_length=128)
     yyds_domain: str | None = Field(default=None, max_length=128)
     gptmail_domain: str | None = Field(default=None, max_length=128)
+    cfmail_domain: str | None = Field(default=None, max_length=128)
+    inbucket_domain: str | None = Field(default=None, max_length=128)
     prefix: str | None = Field(default=None, max_length=64)
     expiry_ms: int | None = Field(default=None, ge=0, le=259200000)
     captcha_provider: str | None = Field(
@@ -1686,20 +1708,24 @@ def _registration_cfg_from_body(body: EmailRegistrationBody | RegistrationConfig
         # Legacy field on EmailRegistrationBody.
         mail_provider = getattr(body, "provider", None)
     return {
+        "mail_providers": getattr(body, "mail_providers", None),
         "mail_provider": mail_provider,
         "base_url": body.base_url,
         "moemail_base_url": getattr(body, "moemail_base_url", None),
         "cfmail_base_url": getattr(body, "cfmail_base_url", None),
+        "inbucket_base_url": getattr(body, "inbucket_base_url", None),
         "api_key": getattr(body, "api_key", None),
         "moemail_api_key": getattr(body, "moemail_api_key", None),
         "yyds_api_key": getattr(body, "yyds_api_key", None),
         "gptmail_api_key": getattr(body, "gptmail_api_key", None),
         "cfmail_api_key": getattr(body, "cfmail_api_key", None),
+        "inbucket_api_key": getattr(body, "inbucket_api_key", None),
         "domain": getattr(body, "domain", None),
         "moemail_domain": getattr(body, "moemail_domain", None),
         "yyds_domain": getattr(body, "yyds_domain", None),
         "gptmail_domain": getattr(body, "gptmail_domain", None),
         "cfmail_domain": getattr(body, "cfmail_domain", None),
+        "inbucket_domain": getattr(body, "inbucket_domain", None),
         "prefix": getattr(body, "prefix", None),
         "expiry_ms": getattr(body, "expiry_ms", None),
         "captcha_provider": getattr(body, "captcha_provider", None),
@@ -1799,6 +1825,7 @@ async def start_email_registration(
             domain=resolved.get("domain") or None,
             expiry_ms=resolved.get("expiry_ms"),
             mail_provider=resolved.get("mail_provider") or None,
+            mail_providers=resolved.get("mail_providers") or None,
             captcha_provider=resolved.get("captcha_provider") or None,
             local_solver_url=resolved.get("local_solver_url") or None,
             yescaptcha_key=resolved.get("yescaptcha_key") or None,

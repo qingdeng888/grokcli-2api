@@ -17,6 +17,7 @@ Legacy browser (DrissionPage) and grpc-session registration engines were removed
 from __future__ import annotations
 
 import json
+import ipaddress
 import os
 import secrets
 import sys
@@ -25,6 +26,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 ROOT = Path(__file__).resolve().parent
 GBA = ROOT / "grok-build-auth"
@@ -170,6 +172,7 @@ def _snapshot_reg_config(
     concurrency: int,
     stagger_ms: int,
     mail_provider: str | None = None,
+    mail_providers: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Config snapshot kept with the in-memory/Redis batch while it is running."""
     return {
@@ -185,6 +188,7 @@ def _snapshot_reg_config(
         "stagger_ms": stagger_ms,
         "local_solver_url": "http://127.0.0.1:5072",
         "mail_provider": (mail_provider or "moemail").strip().lower() or "moemail",
+        "mail_providers": [dict(item) for item in (mail_providers or [])],
     }
 
 
@@ -306,6 +310,14 @@ def _compact_session(sess: dict[str, Any]) -> dict[str, Any]:
     out.pop("_oauth_client", None)
     out.pop("password", None)
     out.pop("yescaptcha_key", None)
+    raw_proxy = str(out.pop("proxy", None) or "").strip()
+    if raw_proxy and not out.get("proxy_display"):
+        out["proxy_display"] = _redact_proxy_url(raw_proxy)
+    if raw_proxy:
+        safe_proxy = str(out.get("proxy_display") or _redact_proxy_url(raw_proxy))
+        for key in ("message", "error", "output_tail", "log"):
+            if out.get(key) is not None:
+                out[key] = str(out[key]).replace(raw_proxy, safe_proxy)
     # Prefer explicit imported ids; fall back to auth_json summary for UI/logs.
     imported_ids = list(out.get("imported_account_ids") or [])
     imported_accounts = list(out.get("imported_accounts") or [])
@@ -332,6 +344,13 @@ def _compact_session(sess: dict[str, Any]) -> dict[str, Any]:
         out["imported_accounts"] = imported_accounts
     # Drop full auth payload from list/poll responses (secrets).
     out.pop("auth_json", None)
+    return out
+
+
+def _compact_batch(batch: dict[str, Any]) -> dict[str, Any]:
+    """Remove the durable batch config because it contains registration secrets."""
+    out = dict(batch)
+    out.pop("reg_config", None)
     return out
 
 
@@ -464,6 +483,23 @@ def registration_available() -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # mail provider: moemail / yyds (reuse grokcli-2api config)
 # --------------------------------------------------------------------------- #
+def _select_mail_provider_entry(
+    providers: list[dict[str, Any]] | None,
+    *,
+    index: int = 1,
+) -> dict[str, Any] | None:
+    """Deterministically distribute batch jobs across providers and domains."""
+    enabled = [dict(item) for item in (providers or []) if isinstance(item, dict) and item.get("enabled", True)]
+    if not enabled:
+        return None
+    pos = max(0, int(index or 1) - 1)
+    entry = enabled[pos % len(enabled)]
+    domains = [str(v or "").strip().lstrip("@").strip(".") for v in (entry.get("domains") or [])]
+    domains = [v for v in domains if v]
+    entry["selected_domain"] = domains[(pos // len(enabled)) % len(domains)] if domains else ""
+    return entry
+
+
 def _make_email_receiver(
     *,
     api_key: str | None = None,
@@ -472,20 +508,27 @@ def _make_email_receiver(
     domain: str | None = None,
     expiry_ms: int | None = None,
     mail_provider: str | None = None,
+    provider_id: str | None = None,
+    provider_label: str | None = None,
 ):
     from moemail import create_mailbox, fetch_messages, normalize_mail_provider
     from config import MOEMAIL_API_KEY, MOEMAIL_BASE_URL, MOEMAIL_DOMAIN, MOEMAIL_EXPIRY_MS
 
+    requested_base = (base_url or "").strip().rstrip("/")
+    prov = normalize_mail_provider(
+        mail_provider, base_url=requested_base or MOEMAIL_BASE_URL
+    )
+    base = requested_base if prov == "inbucket" else (requested_base or MOEMAIL_BASE_URL).rstrip("/")
     key = (api_key or MOEMAIL_API_KEY or "").strip()
-    if not key:
+    if prov != "inbucket" and not key:
         raise ValueError(
             "Mail API key missing. Set GROK2API_MOEMAIL_API_KEY or pass api_key."
         )
-    base = (base_url or MOEMAIL_BASE_URL).rstrip("/")
-    prov = normalize_mail_provider(mail_provider, base_url=base)
+    if prov == "inbucket" and not base:
+        raise ValueError("Inbucket Base URL missing")
     # YYDS/GPTMail/CFMail: empty domain means provider-side auto/random pick.
     # Never bleed MoeMail's MOEMAIL_DOMAIN (default example.com) into them.
-    if prov in {"yyds", "gptmail", "cfmail"}:
+    if prov in {"yyds", "gptmail", "cfmail", "inbucket"}:
         dom = (domain or "").strip().lstrip("@").strip(".")
     else:
         dom = (domain or MOEMAIL_DOMAIN or "").strip().lstrip("@").strip(".")
@@ -515,6 +558,8 @@ def _make_email_receiver(
             *,
             provider: str,
             token: str = "",
+            provider_id: str = "",
+            provider_label: str = "",
         ):
             self.email = email
             self.email_id = email_id
@@ -525,11 +570,16 @@ def _make_email_receiver(
                 default_base = "https://mail.chatgpt.org.uk"
             elif provider == "cfmail":
                 default_base = "https://temp-email-api.awsl.uk"
+            elif provider == "inbucket":
+                default_base = ""
             else:
                 default_base = "https://moemail.521884.xyz"
             self.base_url = base_url or default_base
             self.provider = provider
             self.token = token
+            self.provider_id = provider_id
+            self.provider_label = provider_label or provider
+            self.domain = address.rsplit("@", 1)[1] if "@" in address else dom
 
         def wait_for_code(
             self,
@@ -611,6 +661,8 @@ def _make_email_receiver(
         base_url=base,
         provider=prov,
         token=token,
+        provider_id=str(provider_id or ""),
+        provider_label=str(provider_label or prov),
     )
 
 
@@ -620,6 +672,67 @@ def _proxy_url() -> str:
 
     cfg = normalize_proxy_config(XAI_PROXY or None)
     return cfg["proxy"] if cfg else ""
+
+
+def _redact_proxy_url(proxy: str | None) -> str:
+    """Return a log-safe proxy label without exposing credentials."""
+    raw = str(proxy or "").strip()
+    if not raw:
+        return "直连"
+    try:
+        parsed = urlsplit(raw)
+        host = parsed.hostname or ""
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        if parsed.port is not None:
+            host = f"{host}:{parsed.port}"
+        auth = ""
+        if parsed.username is not None:
+            auth = "***:***@" if parsed.password is not None else "***@"
+        return urlunsplit((parsed.scheme, f"{auth}{host}", "", "", ""))
+    except Exception:
+        scheme = raw.split("://", 1)[0] if "://" in raw else "proxy"
+        return f"{scheme}://***"
+
+
+def _detect_outbound_ip(proxy: str = "", *, timeout: float = 10.0) -> str:
+    """Resolve the worker's public egress IP through its selected proxy."""
+    from curl_cffi import requests as curl_requests
+
+    services = (
+        "https://api.ipify.org?format=json",
+        "https://httpbin.org/ip",
+        "https://ipinfo.io/json",
+    )
+    kwargs: dict[str, Any] = {
+        "impersonate": "chrome",
+        "verify": False,
+        "timeout": timeout,
+    }
+    if proxy:
+        kwargs["proxy"] = proxy
+    errors: list[str] = []
+    for url in services:
+        try:
+            resp = curl_requests.get(url, **kwargs)
+            if resp.status_code != 200:
+                errors.append(f"{url}: HTTP {resp.status_code}")
+                continue
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
+            candidate = str(
+                (data or {}).get("ip") or (data or {}).get("origin") or resp.text or ""
+            ).strip()
+            # httpbin may return a comma-separated proxy chain; the first value
+            # is the public client address observed by the service.
+            candidate = candidate.split(",", 1)[0].strip()
+            ipaddress.ip_address(candidate)
+            return candidate
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{url}: {exc}")
+    raise RuntimeError("; ".join(errors[-3:]) or "无法获取出口 IP")
 
 
 # --------------------------------------------------------------------------- #
@@ -635,6 +748,7 @@ def _prepare_registration_session(
     domain: str | None = None,
     expiry_ms: int | None = None,
     mail_provider: str | None = None,
+    mail_providers: list[dict[str, Any]] | None = None,
     batch_id: str | None = None,
     batch_index: int | None = None,
     batch_total: int | None = None,
@@ -644,6 +758,12 @@ def _prepare_registration_session(
     if start_delay > 0:
         time.sleep(start_delay)
 
+    selected = _select_mail_provider_entry(mail_providers, index=batch_index or 1)
+    if selected:
+        mail_provider = str(selected.get("type") or mail_provider or "moemail")
+        moemail_api_key = str(selected.get("api_key") or "")
+        moemail_base_url = str(selected.get("base_url") or "")
+        domain = str(selected.get("selected_domain") or "")
     try:
         email, receiver = _make_email_receiver(
             api_key=moemail_api_key,
@@ -652,6 +772,8 @@ def _prepare_registration_session(
             domain=domain,
             expiry_ms=expiry_ms,
             mail_provider=mail_provider,
+            provider_id=str((selected or {}).get("id") or ""),
+            provider_label=str((selected or {}).get("label") or mail_provider or ""),
         )
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": str(e)}
@@ -678,6 +800,10 @@ def _prepare_registration_session(
         "batch_id": batch_id,
         "batch_index": batch_index,
         "batch_total": batch_total,
+        "mail_provider_id": getattr(receiver, "provider_id", ""),
+        "mail_provider_type": getattr(receiver, "provider", mail_provider or "moemail"),
+        "mail_provider_label": getattr(receiver, "provider_label", mail_provider or "moemail"),
+        "mail_domain": getattr(receiver, "domain", email.rsplit("@", 1)[1] if "@" in email else ""),
         # Keep receiver process-local only (not mirrored to Redis).
         "_receiver": receiver,
     }
@@ -701,6 +827,7 @@ def _start_one_registration(
     domain: str | None = None,
     expiry_ms: int | None = None,
     mail_provider: str | None = None,
+    mail_providers: list[dict[str, Any]] | None = None,
     batch_id: str | None = None,
     batch_index: int | None = None,
     batch_total: int | None = None,
@@ -716,6 +843,7 @@ def _start_one_registration(
         domain=domain,
         expiry_ms=expiry_ms,
         mail_provider=mail_provider,
+        mail_providers=mail_providers,
         batch_id=batch_id,
         batch_index=batch_index,
         batch_total=batch_total,
@@ -760,6 +888,7 @@ def start_registration(
     domain: str | None = None,
     expiry_ms: int | None = None,
     mail_provider: str | None = None,
+    mail_providers: list[dict[str, Any]] | None = None,
     count: int | None = None,
     concurrency: int | None = None,
     stagger_ms: int | None = None,
@@ -882,6 +1011,15 @@ def start_registration(
     except Exception:
         mail_prov = (mail_provider or "moemail").strip().lower() or "moemail"
 
+    if mail_providers is not None and not any(
+        isinstance(item, dict) and item.get("enabled", True)
+        for item in mail_providers
+    ):
+        return {
+            "ok": False,
+            "error": "没有已启用的邮箱接口，请先在邮箱接口池中添加并启用至少一个接口",
+        }
+
     # Single job — keep original response shape for UI compatibility.
     if n == 1:
         return _start_one_registration(
@@ -893,6 +1031,7 @@ def start_registration(
             domain=domain,
             expiry_ms=expiry_ms,
             mail_provider=mail_prov,
+            mail_providers=mail_providers,
         )
 
     batch_id = f"batch_{uuid.uuid4().hex[:12]}"
@@ -908,6 +1047,7 @@ def start_registration(
         concurrency=workers,
         stagger_ms=stagger,
         mail_provider=mail_prov,
+        mail_providers=mail_providers,
     )
     batch = {
         "id": batch_id,
@@ -948,6 +1088,7 @@ def start_registration(
         domain=domain,
         expiry_ms=expiry_ms,
         mail_provider=mail_prov,
+        mail_providers=mail_providers,
     )
     if not started.get("ok"):
         return started
@@ -993,6 +1134,7 @@ def _spawn_batch_runner(
     domain: str | None,
     expiry_ms: int | None,
     mail_provider: str | None = None,
+    mail_providers: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Start the ThreadPool spawner for a batch. No resume/restart path."""
     bid = str(batch_id or "").strip()
@@ -1094,6 +1236,7 @@ def _spawn_batch_runner(
             concurrency=workers,
             stagger_ms=stagger,
             mail_provider=mail_provider,
+            mail_providers=mail_providers,
         )
         b["updated_at"] = _now()
         b["message"] = f"starting remaining={remaining} threads={workers}"
@@ -1219,6 +1362,7 @@ def _spawn_batch_runner(
                 domain=domain,
                 expiry_ms=expiry_ms,
                 mail_provider=mail_provider,
+                mail_providers=mail_providers,
                 batch_id=bid,
                 batch_index=i,
                 batch_total=int((_load_reg_batch(bid) or {}).get("count") or remaining),
@@ -1616,6 +1760,29 @@ def _run_registration(
         )
         import accounts
         from config import UPSTREAM_BASE
+
+        proxy_display = _redact_proxy_url(proxy)
+        update(
+            "checking_network",
+            f"检测注册出口 IP · 代理: {proxy_display}",
+            proxy_display=proxy_display,
+            outbound_ip="",
+        )
+        try:
+            outbound_ip = _detect_outbound_ip(proxy or "")
+        except Exception as ip_exc:  # noqa: BLE001
+            if proxy:
+                raise RuntimeError(
+                    f"代理验证失败 [{proxy_display}]，无法获取出口 IP"
+                ) from ip_exc
+            outbound_ip = "unknown"
+        update(
+            "network_ready",
+            f"代理: {proxy_display} | 出口 IP: {outbound_ip}",
+            proxy_display=proxy_display,
+            outbound_ip=outbound_ip,
+            outbound_ip_error=("无法获取直连出口 IP" if outbound_ip == "unknown" else ""),
+        )
 
         update("registering", "visiting signup page")
         _check_cancel()
@@ -2336,7 +2503,7 @@ def stop_registration_batch(batch_id: str) -> dict[str, Any]:
         b["updated_at"] = _now()
         _batches[bid] = b
         _mirror_reg_batch(bid, dict(b))
-        out = dict(b)
+        out = _compact_batch(b)
     return {
         "ok": True,
         "batch_id": bid,
@@ -2448,7 +2615,7 @@ def list_registration_sessions() -> dict[str, Any]:
                     and stats.get("missing", 0) == 0
                 ):
                     stats["batch_status"] = "cancelled"
-            item = {**b, **stats}
+            item = {**_compact_batch(b), **stats}
             # Align top-level status with computed batch_status for UI restore filters.
             bst = str(stats.get("batch_status") or "").lower()
             cur = str(b.get("status") or "").lower()
@@ -2480,13 +2647,10 @@ def get_registration_session(
     sess = _load_reg_sess(sid)
     if not sess:
         return None
-    out = dict(sess)
-    out.pop("_client", None)
-    out.pop("_oauth_client", None)
-    out.pop("password", None)
-    out.pop("yescaptcha_key", None)
-    if not include_auth_json:
-        out.pop("auth_json", None)
+    auth_json = sess.get("auth_json") if include_auth_json else None
+    out = _compact_session(sess)
+    if include_auth_json and auth_json is not None:
+        out["auth_json"] = auth_json
     return out
 
 
@@ -2674,7 +2838,7 @@ def get_registration_batch(batch_id: str) -> dict[str, Any] | None:
         )
     except Exception:
         pass
-    out = {**b, **stats, "sessions": sessions}
+    out = {**_compact_batch(b), **stats, "sessions": sessions}
     # Surface effective status for older UIs that only read `status`.
     if stats.get("batch_status"):
         # Don't clobber an explicit cooperative "stopping" marker while workers live.

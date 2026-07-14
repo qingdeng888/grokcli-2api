@@ -9,6 +9,7 @@ import json
 import secrets
 import threading
 import time
+import uuid
 from typing import Any
 
 from config import ACCOUNT_MODE, ADMIN_PASSWORD, DATA_DIR, SETTINGS_FILE
@@ -1381,11 +1382,13 @@ def apply_runtime_settings_to_modules() -> None:
 # ── protocol registration config (MoeMail / YesCaptcha / proxy) ────────────
 
 _REG_CONFIG_KEYS = (
+    "mail_providers",
     "mail_provider",
     "base_url",
     # Per-provider base URLs for self-hosted services (do not share one field).
     "moemail_base_url",
     "cfmail_base_url",
+    "inbucket_base_url",
     # Active key (derived from selected provider). Kept for adapter/env compat.
     "api_key",
     # Per-provider secrets — all persist in DB so switching provider keeps keys.
@@ -1393,12 +1396,14 @@ _REG_CONFIG_KEYS = (
     "yyds_api_key",
     "gptmail_api_key",
     "cfmail_api_key",
+    "inbucket_api_key",
     # Active domain + per-provider domains (same pattern as keys).
     "domain",
     "moemail_domain",
     "yyds_domain",
     "gptmail_domain",
     "cfmail_domain",
+    "inbucket_domain",
     "prefix",
     "expiry_ms",
     "captcha_provider",
@@ -1413,6 +1418,49 @@ _REG_CONFIG_KEYS = (
     "probe_delay_sec",
 )
 
+_MAIL_PROVIDER_TYPES = frozenset({"moemail", "yyds", "gptmail", "cfmail", "inbucket"})
+
+
+def _normalize_mail_providers(value: Any) -> list[dict[str, Any]]:
+    """Normalize independent mail API instances without leaking fields across entries."""
+    if not isinstance(value, list):
+        return []
+    result: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for pos, raw in enumerate(value[:50], start=1):
+        if not isinstance(raw, dict):
+            continue
+        provider_type = str(raw.get("type") or "").strip().lower()
+        if provider_type not in _MAIL_PROVIDER_TYPES:
+            continue
+        provider_id = str(raw.get("id") or "").strip()[:80]
+        if not provider_id or provider_id in seen_ids:
+            provider_id = f"mail_{uuid.uuid4().hex[:16]}"
+        seen_ids.add(provider_id)
+        label = str(raw.get("label") or f"{provider_type}#{pos}").strip()[:80]
+        base_url = str(raw.get("base_url") or "").strip().rstrip("/")[:256]
+        api_key = str(raw.get("api_key") or "").strip()[:512]
+        domain_values = raw.get("domains")
+        if isinstance(domain_values, str):
+            domain_values = domain_values.replace(",", "\n").splitlines()
+        domains: list[str] = []
+        for item in domain_values if isinstance(domain_values, list) else []:
+            domain = str(item or "").strip().lstrip("@").strip(".")[:128]
+            if domain and domain not in domains:
+                domains.append(domain)
+        result.append(
+            {
+                "id": provider_id,
+                "label": label or f"{provider_type}#{pos}",
+                "type": provider_type,
+                "enabled": bool(raw.get("enabled", raw.get("enable", True))),
+                "base_url": base_url,
+                "api_key": api_key,
+                "domains": domains[:100],
+            }
+        )
+    return result
+
 _REG_SECRET_KEYS = frozenset(
     {
         "api_key",
@@ -1420,6 +1468,7 @@ _REG_SECRET_KEYS = frozenset(
         "yyds_api_key",
         "gptmail_api_key",
         "cfmail_api_key",
+        "inbucket_api_key",
         "yescaptcha_key",
         "proxy_password",
     }
@@ -1430,6 +1479,7 @@ _MAIL_PROVIDER_KEY_FIELDS = {
     "yyds": "yyds_api_key",
     "gptmail": "gptmail_api_key",
     "cfmail": "cfmail_api_key",
+    "inbucket": "inbucket_api_key",
 }
 
 _MAIL_PROVIDER_DOMAIN_FIELDS = {
@@ -1437,6 +1487,7 @@ _MAIL_PROVIDER_DOMAIN_FIELDS = {
     "yyds": "yyds_domain",
     "gptmail": "gptmail_domain",
     "cfmail": "cfmail_domain",
+    "inbucket": "inbucket_domain",
 }
 
 # Self-hosted providers keep independent base URLs so switching never overwrites
@@ -1444,6 +1495,7 @@ _MAIL_PROVIDER_DOMAIN_FIELDS = {
 _MAIL_PROVIDER_BASE_URL_FIELDS = {
     "moemail": "moemail_base_url",
     "cfmail": "cfmail_base_url",
+    "inbucket": "inbucket_base_url",
 }
 
 
@@ -1506,6 +1558,13 @@ def _env_registration_defaults() -> dict[str, Any]:
         ).strip()
         if cf_key:
             out["cfmail_api_key"] = cf_key
+        inbucket_key = (
+            os.environ.get("GROK2API_INBUCKET_API_KEY")
+            or os.environ.get("INBUCKET_API_KEY")
+            or ""
+        ).strip()
+        if inbucket_key:
+            out["inbucket_api_key"] = inbucket_key
         yyds_dom = (
             os.environ.get("GROK2API_YYDS_DOMAIN")
             or os.environ.get("YYDS_DOMAIN")
@@ -1527,6 +1586,13 @@ def _env_registration_defaults() -> dict[str, Any]:
         ).strip().lstrip("@").strip(".")
         if cf_dom:
             out["cfmail_domain"] = cf_dom
+        inbucket_dom = (
+            os.environ.get("GROK2API_INBUCKET_DOMAIN")
+            or os.environ.get("INBUCKET_DOMAIN")
+            or ""
+        ).strip().lstrip("@").strip(".")
+        if inbucket_dom:
+            out["inbucket_domain"] = inbucket_dom
         cf_base = (
             os.environ.get("GROK2API_CFMAIL_BASE_URL")
             or os.environ.get("CFMAIL_BASE_URL")
@@ -1535,6 +1601,13 @@ def _env_registration_defaults() -> dict[str, Any]:
         if cf_base:
             # Dedicated CF host only — never overwrite MoeMail base_url.
             out["cfmail_base_url"] = cf_base
+        inbucket_base = (
+            os.environ.get("GROK2API_INBUCKET_BASE_URL")
+            or os.environ.get("INBUCKET_BASE_URL")
+            or ""
+        ).strip()
+        if inbucket_base:
+            out["inbucket_base_url"] = inbucket_base
         if XAI_PROXY:
             out["proxy"] = str(XAI_PROXY)
         if XAI_PROXY_USERNAME:
@@ -1615,11 +1688,13 @@ def _normalize_registration_config(
     legacy_base_url = _pick_str("base_url", 256)
     cfg["moemail_base_url"] = _pick_str("moemail_base_url", 256)
     cfg["cfmail_base_url"] = _pick_str("cfmail_base_url", 256)
+    cfg["inbucket_base_url"] = _pick_str("inbucket_base_url", 256)
     legacy_api_key = _pick_str("api_key", 512)
     cfg["moemail_api_key"] = _pick_str("moemail_api_key", 512)
     cfg["yyds_api_key"] = _pick_str("yyds_api_key", 512)
     cfg["gptmail_api_key"] = _pick_str("gptmail_api_key", 512)
     cfg["cfmail_api_key"] = _pick_str("cfmail_api_key", 512)
+    cfg["inbucket_api_key"] = _pick_str("inbucket_api_key", 512)
     # Do NOT env-fill legacy domain into every provider — only use explicit src.
     if "domain" in src:
         legacy_domain = str(src.get("domain") or "").strip().lstrip("@").strip(".")[:128]
@@ -1629,12 +1704,15 @@ def _normalize_registration_config(
     cfg["yyds_domain"] = _pick_domain("yyds_domain")
     cfg["gptmail_domain"] = _pick_domain("gptmail_domain")
     cfg["cfmail_domain"] = _pick_domain("cfmail_domain")
+    cfg["inbucket_domain"] = _pick_domain("inbucket_domain")
     cfg["prefix"] = _pick_str("prefix", 64)
     try:
         from moemail import (
             normalize_cfmail_base_url,
             normalize_gptmail_base_url,
+            normalize_inbucket_base_url,
             normalize_mail_provider,
+            normalize_proxy_config,
             normalize_yyds_base_url,
         )
     except Exception:
@@ -1642,6 +1720,8 @@ def _normalize_registration_config(
         normalize_yyds_base_url = None  # type: ignore[assignment]
         normalize_gptmail_base_url = None  # type: ignore[assignment]
         normalize_cfmail_base_url = None  # type: ignore[assignment]
+        normalize_inbucket_base_url = None  # type: ignore[assignment]
+        normalize_proxy_config = None  # type: ignore[assignment]
 
     mail_raw = _pick_str("mail_provider", 32).lower()
     # Prefer explicit mail_provider; only use base_url as a hint when empty.
@@ -1650,6 +1730,7 @@ def _normalize_registration_config(
             mail_raw or None,
             base_url=legacy_base_url
             or cfg.get("cfmail_base_url")
+            or cfg.get("inbucket_base_url")
             or cfg.get("moemail_base_url")
             or None,
         )
@@ -1660,10 +1741,12 @@ def _normalize_registration_config(
             cfg["mail_provider"] = "gptmail"
         elif mail_raw in {"cfmail", "cloudflare", "cloudflare_temp_email", "awsl"}:
             cfg["mail_provider"] = "cfmail"
+        elif mail_raw in {"inbucket", "in-bucket", "in_bucket"}:
+            cfg["mail_provider"] = "inbucket"
         else:
             cfg["mail_provider"] = (
                 mail_raw
-                if mail_raw in {"moemail", "yyds", "gptmail", "cfmail"}
+                if mail_raw in {"moemail", "yyds", "gptmail", "cfmail", "inbucket"}
                 else "moemail"
             )
 
@@ -1716,6 +1799,10 @@ def _normalize_registration_config(
     # selected self-hosted provider so adapter/env keep working.
     if normalize_cfmail_base_url is not None and cfg.get("cfmail_base_url"):
         cfg["cfmail_base_url"] = normalize_cfmail_base_url(cfg["cfmail_base_url"])
+    if normalize_inbucket_base_url is not None and cfg.get("inbucket_base_url"):
+        cfg["inbucket_base_url"] = normalize_inbucket_base_url(
+            cfg["inbucket_base_url"]
+        )
     if cfg.get("moemail_base_url"):
         cfg["moemail_base_url"] = str(cfg["moemail_base_url"]).strip().rstrip("/")
 
@@ -1741,6 +1828,14 @@ def _normalize_registration_config(
             else (str(raw_base).strip() or "https://temp-email-api.awsl.uk")
         )
         cfg["base_url"] = cfg["cfmail_base_url"]
+    elif cfg["mail_provider"] == "inbucket":
+        raw_base = cfg.get("inbucket_base_url") or ""
+        cfg["inbucket_base_url"] = (
+            normalize_inbucket_base_url(str(raw_base) if raw_base else None)
+            if normalize_inbucket_base_url is not None
+            else str(raw_base).strip().rstrip("/")
+        )
+        cfg["base_url"] = cfg["inbucket_base_url"]
     else:
         # MoeMail: active base_url mirrors moemail_base_url.
         cfg["base_url"] = str(cfg.get("moemail_base_url") or "").strip()
@@ -1763,9 +1858,26 @@ def _normalize_registration_config(
     else:
         cfg["local_solver_url"] = ""
     cfg["yescaptcha_key"] = _pick_str("yescaptcha_key", 512)
-    cfg["proxy"] = _pick_str("proxy", 512)
-    cfg["proxy_username"] = _pick_str("proxy_username", 256)
-    cfg["proxy_password"] = _pick_str("proxy_password", 512)
+    raw_proxy = _pick_str("proxy", 512)
+    legacy_proxy_username = _pick_str("proxy_username", 256)
+    legacy_proxy_password = _pick_str("proxy_password", 512)
+    if raw_proxy and normalize_proxy_config is not None:
+        try:
+            proxy_cfg = normalize_proxy_config(
+                raw_proxy,
+                username=legacy_proxy_username or None,
+                password=legacy_proxy_password or None,
+            )
+            raw_proxy = str((proxy_cfg or {}).get("proxy") or raw_proxy)
+            legacy_proxy_username = ""
+            legacy_proxy_password = ""
+        except ValueError:
+            # Preserve invalid stored input so the proxy test/start endpoint can
+            # return the validation error instead of silently changing it.
+            pass
+    cfg["proxy"] = raw_proxy
+    cfg["proxy_username"] = legacy_proxy_username
+    cfg["proxy_password"] = legacy_proxy_password
 
     # expiry_ms — MoeMail official presets; YYDS temp mail is ~24h (map to 1 day).
     expiry_raw = src.get("expiry_ms", env.get("expiry_ms", 3600000))
@@ -1808,6 +1920,21 @@ def _normalize_registration_config(
     except (TypeError, ValueError):
         probe_delay = env_probe
     cfg["probe_delay_sec"] = max(0, min(600, probe_delay))
+    providers = _normalize_mail_providers(src.get("mail_providers"))
+    if "mail_providers" not in src:
+        # Read-time compatibility for existing single-provider installations.
+        providers = [
+            {
+                "id": "mail_legacy_primary",
+                "label": f"{cfg['mail_provider'].upper()}-1",
+                "type": cfg["mail_provider"],
+                "enabled": True,
+                "base_url": str(cfg.get("base_url") or ""),
+                "api_key": str(cfg.get("api_key") or ""),
+                "domains": [cfg["domain"]] if cfg.get("domain") else [],
+            }
+        ]
+    cfg["mail_providers"] = providers
     return cfg
 
 
@@ -1840,13 +1967,17 @@ def get_registration_config(*, include_secrets: bool = True) -> dict[str, Any]:
     has_yyds = bool(cfg.get("yyds_api_key"))
     has_gpt = bool(cfg.get("gptmail_api_key"))
     has_cf = bool(cfg.get("cfmail_api_key"))
+    has_inbucket = bool(
+        cfg.get("inbucket_base_url") and cfg.get("inbucket_domain")
+    )
     has_active = bool(cfg.get("api_key"))
     public["configured"] = {
         "moemail": has_moemail,
         "yyds": has_yyds,
         "gptmail": has_gpt,
         "cfmail": has_cf,
-        "mail": has_active or has_moemail or has_yyds or has_gpt or has_cf,
+        "inbucket": has_inbucket,
+        "mail": has_active or has_moemail or has_yyds or has_gpt or has_cf or has_inbucket,
         "yescaptcha": bool(cfg.get("yescaptcha_key")),
         "local_solver": bool(cfg.get("local_solver_url")),
         "captcha": (
@@ -1860,6 +1991,13 @@ def get_registration_config(*, include_secrets: bool = True) -> dict[str, Any]:
     public["mail_provider"] = mail_provider
     # Fixed hosts — UI should not require URL for yyds/gptmail.
     public["mail_base_url_fixed"] = mail_provider in {"yyds", "gptmail"}
+    public["mail_providers"] = []
+    for entry in cfg.get("mail_providers") or []:
+        item = dict(entry)
+        secret = str(item.get("api_key") or "")
+        item["api_key"] = _mask_secret(secret) if secret else ""
+        item["api_key_set"] = bool(secret)
+        public["mail_providers"].append(item)
     return public
 
 
@@ -1899,6 +2037,26 @@ def set_registration_config(
     else:
         base = dict(current_stored)
 
+    if "mail_providers" in patch:
+        incoming = patch.get("mail_providers")
+        if not isinstance(incoming, list):
+            raise ValueError("mail_providers must be an array")
+        old_by_id = {
+            str(item.get("id") or ""): item
+            for item in _normalize_mail_providers(current_stored.get("mail_providers"))
+        }
+        merged_providers: list[dict[str, Any]] = []
+        for item in incoming:
+            if not isinstance(item, dict):
+                continue
+            candidate = dict(item)
+            old = old_by_id.get(str(candidate.get("id") or "")) or {}
+            secret = str(candidate.get("api_key") or "").strip()
+            if _is_masked_secret(secret):
+                candidate["api_key"] = str(old.get("api_key") or "")
+            merged_providers.append(candidate)
+        base["mail_providers"] = _normalize_mail_providers(merged_providers)
+
     # Resolve selected provider early so we can treat inactive slots carefully.
     try:
         from moemail import normalize_mail_provider as _nmp
@@ -1922,6 +2080,8 @@ def set_registration_config(
 
     for key in _REG_CONFIG_KEYS:
         if key not in patch:
+            continue
+        if key == "mail_providers":
             continue
         val = patch.get(key)
         if key in _REG_SECRET_KEYS:
@@ -2045,14 +2205,17 @@ def set_registration_config(
         "yyds_domain",
         "gptmail_domain",
         "cfmail_domain",
+        "inbucket_domain",
         "api_key",
         "moemail_api_key",
         "yyds_api_key",
         "gptmail_api_key",
         "cfmail_api_key",
+        "inbucket_api_key",
         "base_url",
         "moemail_base_url",
         "cfmail_base_url",
+        "inbucket_base_url",
     }
     cleaned = {
         k: v
@@ -2063,13 +2226,13 @@ def set_registration_config(
     for k in ("expiry_ms", "count", "concurrency", "stagger_ms", "probe_delay_sec"):
         cleaned[k] = cfg[k]
     # Always persist active + per-provider domain slots (including empty).
-    for k in ("domain", "moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain"):
+    for k in ("domain", "moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "inbucket_domain"):
         cleaned[k] = str(cfg.get(k) or "").strip().lstrip("@").strip(".")
     # Always persist active + per-provider keys (including empty after clear).
-    for k in ("api_key", "moemail_api_key", "yyds_api_key", "gptmail_api_key", "cfmail_api_key"):
+    for k in ("api_key", "moemail_api_key", "yyds_api_key", "gptmail_api_key", "cfmail_api_key", "inbucket_api_key"):
         cleaned[k] = str(cfg.get(k) or "").strip()
     # Always persist active + per-provider base URLs (including empty after clear).
-    for k in ("base_url", "moemail_base_url", "cfmail_base_url"):
+    for k in ("base_url", "moemail_base_url", "cfmail_base_url", "inbucket_base_url"):
         cleaned[k] = str(cfg.get(k) or "").strip().rstrip("/")
 
     _set_setting_value("registration_config", cleaned)
@@ -2093,19 +2256,22 @@ def apply_registration_config_to_runtime(cfg: dict[str, Any] | None = None) -> N
             os.environ.pop(name, None)
 
     mail_provider = str(cfg.get("mail_provider") or "moemail").strip().lower()
-    if mail_provider not in {"moemail", "yyds", "gptmail", "cfmail"}:
+    if mail_provider not in {"moemail", "yyds", "gptmail", "cfmail", "inbucket"}:
         mail_provider = "moemail"
     # Prefer per-provider key; fall back to legacy api_key.
     slot = _MAIL_PROVIDER_KEY_FIELDS.get(mail_provider, "moemail_api_key")
     api_key = str(cfg.get(slot) or cfg.get("api_key") or "").strip()
     moe_base = str(cfg.get("moemail_base_url") or "").strip().rstrip("/")
     cf_base = str(cfg.get("cfmail_base_url") or "").strip().rstrip("/")
+    inbucket_base = str(cfg.get("inbucket_base_url") or "").strip().rstrip("/")
     if mail_provider == "yyds":
         base_url = "https://maliapi.215.im"
     elif mail_provider == "gptmail":
         base_url = "https://mail.chatgpt.org.uk"
     elif mail_provider == "cfmail":
         base_url = cf_base or str(cfg.get("base_url") or "").strip().rstrip("/")
+    elif mail_provider == "inbucket":
+        base_url = inbucket_base or str(cfg.get("base_url") or "").strip().rstrip("/")
     else:
         base_url = moe_base or str(cfg.get("base_url") or "").strip().rstrip("/")
     dslot = _MAIL_PROVIDER_DOMAIN_FIELDS.get(mail_provider, "moemail_domain")
@@ -2131,6 +2297,7 @@ def apply_registration_config_to_runtime(cfg: dict[str, Any] | None = None) -> N
     ykey = str(cfg.get("yyds_api_key") or "").strip()
     gkey = str(cfg.get("gptmail_api_key") or "").strip()
     ckey = str(cfg.get("cfmail_api_key") or "").strip()
+    ikey = str(cfg.get("inbucket_api_key") or "").strip()
     _set_env("GROK2API_MOEMAIL_ONLY_API_KEY", mkey)
     _set_env("GROK2API_YYDS_API_KEY", ykey)
     _set_env("YYDS_API_KEY", ykey)
@@ -2138,11 +2305,15 @@ def apply_registration_config_to_runtime(cfg: dict[str, Any] | None = None) -> N
     _set_env("GPTMAIL_API_KEY", gkey)
     _set_env("GROK2API_CFMAIL_API_KEY", ckey)
     _set_env("CFMAIL_API_KEY", ckey)
+    _set_env("GROK2API_INBUCKET_API_KEY", ikey)
+    _set_env("INBUCKET_API_KEY", ikey)
     # Keep MoeMail / CF hosts in dedicated env slots — never overwrite one with
     # the other when switching the active provider.
     _set_env("GROK2API_MOEMAIL_BASE_URL", moe_base if mail_provider == "moemail" else moe_base)
     _set_env("GROK2API_CFMAIL_BASE_URL", cf_base)
     _set_env("CFMAIL_BASE_URL", cf_base)
+    _set_env("GROK2API_INBUCKET_BASE_URL", inbucket_base)
+    _set_env("INBUCKET_BASE_URL", inbucket_base)
     if base_url:
         # Active adapter host (helpers still read MOEMAIL_BASE_URL historically).
         _set_env("GROK2API_MOEMAIL_BASE_URL", base_url if mail_provider != "cfmail" else moe_base)
@@ -2151,6 +2322,11 @@ def apply_registration_config_to_runtime(cfg: dict[str, Any] | None = None) -> N
             _set_env("CFMAIL_BASE_URL", base_url)
             # Active helpers fall back to MOEMAIL_BASE_URL — mirror CF host only
             # while CF is selected so create/fetch hit the right Workers URL.
+            _set_env("GROK2API_MOEMAIL_BASE_URL", base_url)
+            _set_env("MOEMAIL_BASE_URL", base_url)
+        elif mail_provider == "inbucket":
+            _set_env("GROK2API_INBUCKET_BASE_URL", base_url)
+            _set_env("INBUCKET_BASE_URL", base_url)
             _set_env("GROK2API_MOEMAIL_BASE_URL", base_url)
             _set_env("MOEMAIL_BASE_URL", base_url)
         elif mail_provider == "moemail":
@@ -2163,6 +2339,8 @@ def apply_registration_config_to_runtime(cfg: dict[str, Any] | None = None) -> N
         # Keep dedicated CF domain env in sync with stored slot even when inactive.
         _set_env("GROK2API_CFMAIL_DOMAIN", str(cfg.get("cfmail_domain") or "").strip())
         _set_env("CFMAIL_DOMAIN", str(cfg.get("cfmail_domain") or "").strip())
+    _set_env("GROK2API_INBUCKET_DOMAIN", str(cfg.get("inbucket_domain") or "").strip())
+    _set_env("INBUCKET_DOMAIN", str(cfg.get("inbucket_domain") or "").strip())
     try:
         probe_delay = int(cfg.get("probe_delay_sec", 30))
     except (TypeError, ValueError):
@@ -2198,12 +2376,9 @@ def apply_registration_config_to_runtime(cfg: dict[str, Any] | None = None) -> N
         else:
             os.environ.pop("GROK2API_YESCAPTCHA_KEY", None)
             os.environ.pop("YESCAPTCHA_API_KEY", None)
-    if proxy:
-        _set_env("GROK2API_XAI_PROXY", proxy)
-    if proxy_user:
-        _set_env("GROK2API_XAI_PROXY_USERNAME", proxy_user)
-    if proxy_pass:
-        _set_env("GROK2API_XAI_PROXY_PASSWORD", proxy_pass)
+    _set_env("GROK2API_XAI_PROXY", proxy)
+    _set_env("GROK2API_XAI_PROXY_USERNAME", proxy_user)
+    _set_env("GROK2API_XAI_PROXY_PASSWORD", proxy_pass)
     if cfg.get("expiry_ms") is not None:
         try:
             _set_env("GROK2API_MOEMAIL_EXPIRY_MS", str(int(cfg["expiry_ms"])))
@@ -2225,12 +2400,9 @@ def apply_registration_config_to_runtime(cfg: dict[str, Any] | None = None) -> N
                 _cfg.MOEMAIL_EXPIRY_MS = int(cfg["expiry_ms"])
             except (TypeError, ValueError):
                 pass
-        if proxy:
-            _cfg.XAI_PROXY = proxy
-        if proxy_user:
-            _cfg.XAI_PROXY_USERNAME = proxy_user
-        if proxy_pass:
-            _cfg.XAI_PROXY_PASSWORD = proxy_pass
+        _cfg.XAI_PROXY = proxy
+        _cfg.XAI_PROXY_USERNAME = proxy_user
+        _cfg.XAI_PROXY_PASSWORD = proxy_pass
     except Exception:
         pass
 
