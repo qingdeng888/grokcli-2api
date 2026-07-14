@@ -261,6 +261,18 @@ class EmailRegistrationBody(BaseModel):
         le=10000,
         description="Stagger delay between worker starts (ms)",
     )
+    register_delay_min_sec: int | None = Field(
+        default=None,
+        ge=0,
+        le=86400,
+        description="Minimum random wait after each registration attempt (seconds)",
+    )
+    register_delay_max_sec: int | None = Field(
+        default=None,
+        ge=0,
+        le=86400,
+        description="Maximum random wait after each registration attempt (seconds)",
+    )
     probe_delay_sec: int | None = Field(
         default=None,
         ge=0,
@@ -335,6 +347,8 @@ class RegistrationConfigBody(BaseModel):
     count: int | None = Field(default=None, ge=1, le=10000)
     concurrency: int | None = Field(default=None, ge=1, le=10)
     stagger_ms: int | None = Field(default=None, ge=0, le=10000)
+    register_delay_min_sec: int | None = Field(default=None, ge=0, le=86400)
+    register_delay_max_sec: int | None = Field(default=None, ge=0, le=86400)
     probe_delay_sec: int | None = Field(
         default=None,
         ge=0,
@@ -1737,6 +1751,8 @@ def _registration_cfg_from_body(body: EmailRegistrationBody | RegistrationConfig
         "count": getattr(body, "count", None),
         "concurrency": getattr(body, "concurrency", None),
         "stagger_ms": getattr(body, "stagger_ms", None),
+        "register_delay_min_sec": getattr(body, "register_delay_min_sec", None),
+        "register_delay_max_sec": getattr(body, "register_delay_max_sec", None),
         "probe_delay_sec": getattr(body, "probe_delay_sec", None),
     }
 
@@ -1800,7 +1816,8 @@ async def start_email_registration(
 ):
     """Start protocol registration (grok-build-auth) + mail provider + SSO import.
 
-    Supports multi-thread batch via count/concurrency/stagger_ms.
+    Supports multi-thread batch via count/concurrency/stagger_ms and a random
+    post-attempt delay range.
     Non-empty form fields override the saved DB/env config; empty fields fall
     back to the persisted registration_config. Successful starts also auto-save
     non-secret form defaults (and any newly provided secrets) to the DB.
@@ -1832,6 +1849,8 @@ async def start_email_registration(
             count=resolved.get("count"),
             concurrency=resolved.get("concurrency"),
             stagger_ms=resolved.get("stagger_ms"),
+            register_delay_min_sec=resolved.get("register_delay_min_sec"),
+            register_delay_max_sec=resolved.get("register_delay_max_sec"),
             probe_delay_sec=resolved.get("probe_delay_sec"),
         )
     except TypeError:

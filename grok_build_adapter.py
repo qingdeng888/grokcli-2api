@@ -30,7 +30,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 ROOT = Path(__file__).resolve().parent
 GBA = ROOT / "grok-build-auth"
-ADAPTER_BUILD = "2026-07-13-reg-stop-fast-1"
+ADAPTER_BUILD = "2026-07-15-mail-rotation-delay-1"
 # Newly registered accounts often need a short settle window before probe.
 REGISTER_PROBE_DELAY_SEC = float(
     os.environ.get("GROK2API_REG_PROBE_DELAY_SEC", "30") or 30
@@ -171,6 +171,8 @@ def _snapshot_reg_config(
     expiry_ms: int | None,
     concurrency: int,
     stagger_ms: int,
+    register_delay_min_sec: int = 0,
+    register_delay_max_sec: int = 0,
     mail_provider: str | None = None,
     mail_providers: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -186,6 +188,8 @@ def _snapshot_reg_config(
         "expiry_ms": expiry_ms,
         "concurrency": concurrency,
         "stagger_ms": stagger_ms,
+        "register_delay_min_sec": register_delay_min_sec,
+        "register_delay_max_sec": register_delay_max_sec,
         "local_solver_url": "http://127.0.0.1:5072",
         "mail_provider": (mail_provider or "moemail").strip().lower() or "moemail",
         "mail_providers": [dict(item) for item in (mail_providers or [])],
@@ -488,16 +492,98 @@ def _select_mail_provider_entry(
     *,
     index: int = 1,
 ) -> dict[str, Any] | None:
-    """Deterministically distribute batch jobs across providers and domains."""
+    """Select one item from a pre-randomized provider/domain rotation."""
     enabled = [dict(item) for item in (providers or []) if isinstance(item, dict) and item.get("enabled", True)]
     if not enabled:
         return None
     pos = max(0, int(index or 1) - 1)
     entry = enabled[pos % len(enabled)]
+    if "selected_domain" in entry:
+        return entry
     domains = [str(v or "").strip().lstrip("@").strip(".") for v in (entry.get("domains") or [])]
     domains = [v for v in domains if v]
     entry["selected_domain"] = domains[(pos // len(enabled)) % len(domains)] if domains else ""
     return entry
+
+
+def _build_mail_provider_rotation(
+    providers: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Flatten enabled provider/domain pairs and shuffle once per batch.
+
+    The resulting list is then consumed by ``batch_index`` modulo its length,
+    so concurrency only controls how many jobs run at once and cannot change
+    the round-robin order.
+    """
+    rotation: list[dict[str, Any]] = []
+    for raw in providers or []:
+        if not isinstance(raw, dict) or not raw.get("enabled", True):
+            continue
+        entry = dict(raw)
+        domain_values = entry.get("domains")
+        if isinstance(domain_values, str):
+            domain_values = domain_values.replace(",", "\n").splitlines()
+        domains: list[str] = []
+        for value in domain_values if isinstance(domain_values, list) else []:
+            domain = str(value or "").strip().lstrip("@").strip(".")
+            if domain and domain not in domains:
+                domains.append(domain)
+        if domains:
+            for domain in domains:
+                route = dict(entry)
+                route["domains"] = [domain]
+                route["selected_domain"] = domain
+                rotation.append(route)
+        else:
+            entry["domains"] = []
+            entry["selected_domain"] = ""
+            rotation.append(entry)
+    secrets.SystemRandom().shuffle(rotation)
+    return rotation
+
+
+def _normalize_registration_delay_bounds(
+    minimum: int | float | None,
+    maximum: int | float | None,
+) -> tuple[int, int]:
+    """Clamp and order post-registration delay bounds in seconds."""
+    try:
+        low = int(float(minimum or 0))
+    except (TypeError, ValueError):
+        low = 0
+    try:
+        high = int(float(maximum or 0))
+    except (TypeError, ValueError):
+        high = 0
+    low = max(0, min(86_400, low))
+    high = max(0, min(86_400, high))
+    return (low, high) if low <= high else (high, low)
+
+
+def _wait_random_registration_delay(
+    minimum: int | float | None,
+    maximum: int | float | None,
+    *,
+    cancel_requested: Any | None = None,
+) -> int:
+    """Wait an inclusive random number of seconds, interruptible by stop."""
+    low, high = _normalize_registration_delay_bounds(minimum, maximum)
+    delay = low if low == high else low + secrets.randbelow(high - low + 1)
+    if delay <= 0:
+        return 0
+    deadline = time.monotonic() + delay
+    while True:
+        if callable(cancel_requested):
+            try:
+                if cancel_requested():
+                    break
+            except Exception:
+                pass
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(1.0, remaining))
+    return delay
 
 
 def _make_email_receiver(
@@ -892,6 +978,8 @@ def start_registration(
     count: int | None = None,
     concurrency: int | None = None,
     stagger_ms: int | None = None,
+    register_delay_min_sec: int | None = None,
+    register_delay_max_sec: int | None = None,
     probe_delay_sec: float | int | None = None,
 ) -> dict[str, Any]:
     """Start one or many registration sessions (multi-thread).
@@ -1002,6 +1090,10 @@ def start_registration(
     except (TypeError, ValueError):
         stagger = 400
     stagger = max(0, min(stagger, 10_000))
+    delay_min, delay_max = _normalize_registration_delay_bounds(
+        register_delay_min_sec,
+        register_delay_max_sec,
+    )
 
     proxy_val = (proxy or _proxy_url() or "").strip()
     try:
@@ -1011,14 +1103,14 @@ def start_registration(
     except Exception:
         mail_prov = (mail_provider or "moemail").strip().lower() or "moemail"
 
-    if mail_providers is not None and not any(
-        isinstance(item, dict) and item.get("enabled", True)
-        for item in mail_providers
-    ):
-        return {
-            "ok": False,
-            "error": "没有已启用的邮箱接口，请先在邮箱接口池中添加并启用至少一个接口",
-        }
+    mail_rotation = mail_providers
+    if mail_providers is not None:
+        mail_rotation = _build_mail_provider_rotation(mail_providers)
+        if not mail_rotation:
+            return {
+                "ok": False,
+                "error": "没有已启用的邮箱接口，请先在邮箱接口池中添加并启用至少一个接口",
+            }
 
     # Single job — keep original response shape for UI compatibility.
     if n == 1:
@@ -1031,7 +1123,7 @@ def start_registration(
             domain=domain,
             expiry_ms=expiry_ms,
             mail_provider=mail_prov,
-            mail_providers=mail_providers,
+            mail_providers=mail_rotation,
         )
 
     batch_id = f"batch_{uuid.uuid4().hex[:12]}"
@@ -1046,6 +1138,8 @@ def start_registration(
         expiry_ms=expiry_ms,
         concurrency=workers,
         stagger_ms=stagger,
+        register_delay_min_sec=delay_min,
+        register_delay_max_sec=delay_max,
         mail_provider=mail_prov,
         mail_providers=mail_providers,
     )
@@ -1057,6 +1151,8 @@ def start_registration(
         "count": n,
         "concurrency": workers,
         "stagger_ms": stagger,
+        "register_delay_min_sec": delay_min,
+        "register_delay_max_sec": delay_max,
         "session_ids": [],
         "adapter_build": ADAPTER_BUILD,
         "message": f"batch started count={n} concurrency={workers}",
@@ -1079,6 +1175,8 @@ def start_registration(
         remaining=n,
         concurrency=workers,
         stagger_ms=stagger,
+        register_delay_min_sec=delay_min,
+        register_delay_max_sec=delay_max,
         captcha_provider=provider,
         yescaptcha_key=key,
         proxy=proxy_val,
@@ -1089,6 +1187,7 @@ def start_registration(
         expiry_ms=expiry_ms,
         mail_provider=mail_prov,
         mail_providers=mail_providers,
+        mail_rotation=mail_rotation,
     )
     if not started.get("ok"):
         return started
@@ -1107,6 +1206,8 @@ def start_registration(
         "count": n,
         "concurrency": workers,
         "stagger_ms": stagger,
+        "register_delay_min_sec": delay_min,
+        "register_delay_max_sec": delay_max,
         "session_ids": sids,
         "sessions": sessions,
         "adapter_build": ADAPTER_BUILD,
@@ -1125,6 +1226,8 @@ def _spawn_batch_runner(
     remaining: int,
     concurrency: int,
     stagger_ms: int,
+    register_delay_min_sec: int,
+    register_delay_max_sec: int,
     captcha_provider: str,
     yescaptcha_key: str,
     proxy: str,
@@ -1135,6 +1238,7 @@ def _spawn_batch_runner(
     expiry_ms: int | None,
     mail_provider: str | None = None,
     mail_providers: list[dict[str, Any]] | None = None,
+    mail_rotation: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Start the ThreadPool spawner for a batch. No resume/restart path."""
     bid = str(batch_id or "").strip()
@@ -1214,6 +1318,13 @@ def _spawn_batch_runner(
     proxy_val = (proxy or "").strip()
     workers = max(1, min(int(concurrency or DEFAULT_CONCURRENCY), MAX_CONCURRENCY, remaining))
     stagger = max(0, min(int(stagger_ms or 400), 10_000))
+    delay_min, delay_max = _normalize_registration_delay_bounds(
+        register_delay_min_sec,
+        register_delay_max_sec,
+    )
+    provider_rotation = mail_rotation
+    if provider_rotation is None and mail_providers is not None:
+        provider_rotation = _build_mail_provider_rotation(mail_providers)
 
     with _lock:
         b = _batches.get(bid) or dict(batch)
@@ -1221,6 +1332,8 @@ def _spawn_batch_runner(
         b["cancel_requested"] = False
         b["concurrency"] = workers
         b["stagger_ms"] = stagger
+        b["register_delay_min_sec"] = delay_min
+        b["register_delay_max_sec"] = delay_max
         b["runner_alive"] = True
         b["owner_pid"] = os.getpid()
         b["adapter_build"] = ADAPTER_BUILD
@@ -1235,6 +1348,8 @@ def _spawn_batch_runner(
             expiry_ms=expiry_ms,
             concurrency=workers,
             stagger_ms=stagger,
+            register_delay_min_sec=delay_min,
+            register_delay_max_sec=delay_max,
             mail_provider=mail_provider,
             mail_providers=mail_providers,
         )
@@ -1351,6 +1466,15 @@ def _spawn_batch_runner(
                     "status": "cancelled",
                     "error": "cancelled before start",
                 }
+
+            def _finish_attempt(result: dict[str, Any]) -> dict[str, Any]:
+                _wait_random_registration_delay(
+                    delay_min,
+                    delay_max,
+                    cancel_requested=_batch_cancel_requested,
+                )
+                return result
+
             # Small per-slot stagger only (not cumulative across the whole batch).
             delay = (stagger / 1000.0) * ((i - 1) % max(1, workers))
             prepared = _prepare_registration_session(
@@ -1362,14 +1486,14 @@ def _spawn_batch_runner(
                 domain=domain,
                 expiry_ms=expiry_ms,
                 mail_provider=mail_provider,
-                mail_providers=mail_providers,
+                mail_providers=provider_rotation,
                 batch_id=bid,
                 batch_index=i,
                 batch_total=int((_load_reg_batch(bid) or {}).get("count") or remaining),
                 start_delay=delay,
             )
             if not prepared.get("ok"):
-                return prepared
+                return _finish_attempt(prepared)
             sid = str(prepared.get("id") or "")
             with _lock:
                 # Re-check cancel after prepare (user may stop mid-queue).
@@ -1404,9 +1528,18 @@ def _spawn_batch_runner(
                     _sessions[sid]["updated_at"] = _now()
                     _mirror_reg_sess(sid, _sessions[sid])
             if not sid or receiver is None:
-                return {"ok": False, "error": "registration session prepare failed", "id": sid}
+                return _finish_attempt(
+                    {"ok": False, "error": "registration session prepare failed", "id": sid}
+                )
             try:
                 _run_registration(sid, key, proxy_val or "", receiver)
+            except Exception:
+                _wait_random_registration_delay(
+                    delay_min,
+                    delay_max,
+                    cancel_requested=_batch_cancel_requested,
+                )
+                raise
             finally:
                 with _lock:
                     if sid in _sessions:
@@ -1415,13 +1548,15 @@ def _spawn_batch_runner(
                 final = _sessions.get(sid) or {}
             st = str(final.get("status") or "")
             ok = st in ("imported", "success", "completed")
-            return {
-                "ok": ok,
-                "id": sid,
-                "status": st,
-                "error": final.get("error"),
-                "email": final.get("email"),
-            }
+            return _finish_attempt(
+                {
+                    "ok": ok,
+                    "id": sid,
+                    "status": st,
+                    "error": final.get("error"),
+                    "email": final.get("email"),
+                }
+            )
 
         def _note_result(idx: int, r: dict[str, Any] | None = None, exc: Exception | None = None) -> None:
             nonlocal finished, ok_n, fail_n

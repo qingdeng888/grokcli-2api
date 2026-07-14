@@ -338,6 +338,14 @@
     <div class="g2a-field"><label title="同时注册的线程数：3 就是同时只跑 3 个，完成一个再补一个">线程数</label><input id="reg-concurrency" type="number" min="1" max="10" value="5" /></div>
     <div class="g2a-field"><label title="同一波线程启动时的错峰间隔（毫秒）">错峰 ms</label><input id="reg-stagger-ms" type="number" min="0" value="300" /></div>
     <div class="g2a-field">
+      <label for="reg-delay-min-sec" title="每次注册成功或失败后，当前线程继续下一任务前的最短等待时间">注册间隔下限秒</label>
+      <input id="reg-delay-min-sec" type="number" min="0" max="86400" step="1" value="0" />
+    </div>
+    <div class="g2a-field">
+      <label for="reg-delay-max-sec" title="每次注册成功或失败后，当前线程继续下一任务前的最长等待时间">注册间隔上限秒</label>
+      <input id="reg-delay-max-sec" type="number" min="0" max="86400" step="1" value="0" />
+    </div>
+    <div class="g2a-field">
       <label for="reg-probe-delay-sec" title="新账号入池后等待多少秒再自动测活；0=立即测活">测活等待秒</label>
       <input id="reg-probe-delay-sec" type="number" min="0" max="600" step="1" value="30" />
     </div>

@@ -1415,6 +1415,8 @@ _REG_CONFIG_KEYS = (
     "count",
     "concurrency",
     "stagger_ms",
+    "register_delay_min_sec",
+    "register_delay_max_sec",
     "probe_delay_sec",
 )
 
@@ -1908,6 +1910,13 @@ def _normalize_registration_config(
     cfg["count"] = _int_field("count", 1, 1, 10_000)
     cfg["concurrency"] = _int_field("concurrency", 5, 1, 10)
     cfg["stagger_ms"] = _int_field("stagger_ms", 400, 0, 10_000)
+    delay_min = _int_field("register_delay_min_sec", 0, 0, 86_400)
+    delay_max = _int_field("register_delay_max_sec", 0, 0, 86_400)
+    cfg["register_delay_min_sec"], cfg["register_delay_max_sec"] = (
+        (delay_min, delay_max)
+        if delay_min <= delay_max
+        else (delay_max, delay_min)
+    )
     # New-account auto-probe settle window (seconds). 0 = probe immediately.
     # Prefer form/DB value; fall back to env GROK2API_REG_PROBE_DELAY_SEC.
     try:
@@ -2223,7 +2232,15 @@ def set_registration_config(
         if not (isinstance(v, str) and v == "" and k not in keep_empty)
     }
     # Always keep numeric defaults
-    for k in ("expiry_ms", "count", "concurrency", "stagger_ms", "probe_delay_sec"):
+    for k in (
+        "expiry_ms",
+        "count",
+        "concurrency",
+        "stagger_ms",
+        "register_delay_min_sec",
+        "register_delay_max_sec",
+        "probe_delay_sec",
+    ):
         cleaned[k] = cfg[k]
     # Always persist active + per-provider domain slots (including empty).
     for k in ("domain", "moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "inbucket_domain"):

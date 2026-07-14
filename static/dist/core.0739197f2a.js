@@ -2694,6 +2694,12 @@ function readRegConfig() {
     count: $("reg-count") ? $("reg-count").value.trim() : "1",
     concurrency: $("reg-concurrency") ? $("reg-concurrency").value.trim() : "5",
     stagger_ms: $("reg-stagger-ms") ? $("reg-stagger-ms").value.trim() : "300",
+    register_delay_min_sec: $("reg-delay-min-sec")
+      ? $("reg-delay-min-sec").value.trim()
+      : "0",
+    register_delay_max_sec: $("reg-delay-max-sec")
+      ? $("reg-delay-max-sec").value.trim()
+      : "0",
     probe_delay_sec: $("reg-probe-delay-sec")
       ? $("reg-probe-delay-sec").value.trim()
       : "30",
@@ -2861,6 +2867,12 @@ function applyRegConfig(cfg) {
   if ($("reg-count")) $("reg-count").value = cfg.count != null ? String(cfg.count) : "1";
   if ($("reg-concurrency")) $("reg-concurrency").value = cfg.concurrency != null ? String(cfg.concurrency) : "5";
   if ($("reg-stagger-ms")) $("reg-stagger-ms").value = cfg.stagger_ms != null ? String(cfg.stagger_ms) : "300";
+  const delayMin = Number.parseInt(cfg.register_delay_min_sec ?? "0", 10);
+  const delayMax = Number.parseInt(cfg.register_delay_max_sec ?? "0", 10);
+  const normalizedDelayMin = Math.max(0, Math.min(86400, Number.isFinite(delayMin) ? delayMin : 0));
+  const normalizedDelayMax = Math.max(0, Math.min(86400, Number.isFinite(delayMax) ? delayMax : 0));
+  if ($("reg-delay-min-sec")) $("reg-delay-min-sec").value = String(Math.min(normalizedDelayMin, normalizedDelayMax));
+  if ($("reg-delay-max-sec")) $("reg-delay-max-sec").value = String(Math.max(normalizedDelayMin, normalizedDelayMax));
   if ($("reg-probe-delay-sec")) {
     const pd = cfg.probe_delay_sec != null ? Number(cfg.probe_delay_sec) : 30;
     $("reg-probe-delay-sec").value = String(
@@ -3063,11 +3075,17 @@ function buildRegBody(config) {
   const count = Number.parseInt(config.count || "1", 10);
   const concurrency = Number.parseInt(config.concurrency || "5", 10);
   const stagger = Number.parseInt(config.stagger_ms || "300", 10);
+  const delayMin = Number.parseInt(config.register_delay_min_sec || "0", 10);
+  const delayMax = Number.parseInt(config.register_delay_max_sec || "0", 10);
   const probeDelay = Number.parseInt(config.probe_delay_sec || "30", 10);
   if (Number.isFinite(count) && count > 0) body.count = Math.floor(count);
   // threads / concurrency: real in-flight registration cap (3 => 3 at a time)
   if (Number.isFinite(concurrency) && concurrency > 0) body.concurrency = Math.min(10, Math.max(1, Math.floor(concurrency)));
   if (Number.isFinite(stagger) && stagger >= 0) body.stagger_ms = Math.min(10000, Math.floor(stagger));
+  const normalizedDelayMin = Math.max(0, Math.min(86400, Number.isFinite(delayMin) ? Math.floor(delayMin) : 0));
+  const normalizedDelayMax = Math.max(0, Math.min(86400, Number.isFinite(delayMax) ? Math.floor(delayMax) : 0));
+  body.register_delay_min_sec = Math.min(normalizedDelayMin, normalizedDelayMax);
+  body.register_delay_max_sec = Math.max(normalizedDelayMin, normalizedDelayMax);
   if (Number.isFinite(probeDelay) && probeDelay >= 0) {
     body.probe_delay_sec = Math.min(600, Math.max(0, Math.floor(probeDelay)));
   }
