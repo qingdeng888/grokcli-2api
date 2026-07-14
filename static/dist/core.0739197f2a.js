@@ -3172,6 +3172,21 @@ function collectImportedAccountIds(sessions) {
   return out;
 }
 
+function formatRegDelayState(s) {
+  const delay = Number((s && s.register_delay_sec) || 0);
+  if (!Number.isFinite(delay) || delay <= 0) return "";
+  if (s && s.register_delay_active) {
+    const until = Number(s.register_delay_until || 0);
+    const remaining = until > 0
+      ? Math.max(0, Math.ceil(until - Date.now() / 1000))
+      : Math.max(0, Math.ceil(delay));
+    return `随机延时 ${Math.ceil(delay)} 秒（剩余 ${remaining} 秒）`;
+  }
+  return s && s.register_delay_completed === false
+    ? `随机延时 ${Math.ceil(delay)} 秒已中断`
+    : `随机延时 ${Math.ceil(delay)} 秒已完成`;
+}
+
 function formatRegSessionLine(s, idx) {
   const st = regStatusOf(s) || "—";
   const email = (s && s.email) || "—";
@@ -3184,6 +3199,8 @@ function formatRegSessionLine(s, idx) {
   const mailLabel = String((s && (s.mail_provider_label || s.mail_provider_type)) || "").trim();
   const mailDomain = String((s && s.mail_domain) || "").trim();
   const mailTxt = mailLabel || mailDomain ? ` | 邮箱 ${mailLabel || "—"}${mailDomain ? ` → ${mailDomain}` : ""}` : "";
+  const delayLabel = formatRegDelayState(s);
+  const delayTxt = delayLabel ? ` | ${delayLabel}` : "";
   if (proxyDisplay || outboundIp || outboundIpError) {
     const route = !proxyDisplay || proxyDisplay === "直连"
       ? "直连"
@@ -3201,7 +3218,7 @@ function formatRegSessionLine(s, idx) {
     probeTxt = " | 测活中…";
   }
   const shortMsg = msg ? ` | ${String(msg).slice(0, 120)}` : "";
-  return `[${idx + 1}] ${st.padEnd(10)} ${email} (${id})${mailTxt}${networkTxt}${probeTxt}${shortMsg}`;
+  return `[${idx + 1}] ${st.padEnd(10)} ${email} (${id})${mailTxt}${networkTxt}${probeTxt}${delayTxt}${shortMsg}`;
 }
 
 function buildRegLogText(sessions, { batch = null, extraLines = [] } = {}) {

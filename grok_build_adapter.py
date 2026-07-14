@@ -30,7 +30,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 ROOT = Path(__file__).resolve().parent
 GBA = ROOT / "grok-build-auth"
-ADAPTER_BUILD = "2026-07-15-mail-rotation-delay-1"
+ADAPTER_BUILD = "2026-07-15-mail-rotation-delay-log-1"
 # Newly registered accounts often need a short settle window before probe.
 REGISTER_PROBE_DELAY_SEC = float(
     os.environ.get("GROK2API_REG_PROBE_DELAY_SEC", "30") or 30
@@ -565,17 +565,26 @@ def _wait_random_registration_delay(
     maximum: int | float | None,
     *,
     cancel_requested: Any | None = None,
+    on_start: Any | None = None,
+    on_finish: Any | None = None,
 ) -> int:
     """Wait an inclusive random number of seconds, interruptible by stop."""
     low, high = _normalize_registration_delay_bounds(minimum, maximum)
     delay = low if low == high else low + secrets.randbelow(high - low + 1)
     if delay <= 0:
         return 0
+    if callable(on_start):
+        try:
+            on_start(delay)
+        except Exception:
+            pass
     deadline = time.monotonic() + delay
+    completed = True
     while True:
         if callable(cancel_requested):
             try:
                 if cancel_requested():
+                    completed = False
                     break
             except Exception:
                 pass
@@ -583,6 +592,11 @@ def _wait_random_registration_delay(
         if remaining <= 0:
             break
         time.sleep(min(1.0, remaining))
+    if callable(on_finish):
+        try:
+            on_finish(delay, completed)
+        except Exception:
+            pass
     return delay
 
 
@@ -1467,12 +1481,47 @@ def _spawn_batch_runner(
                     "error": "cancelled before start",
                 }
 
-            def _finish_attempt(result: dict[str, Any]) -> dict[str, Any]:
+            def _set_delay_state(
+                session_id: str,
+                delay: int,
+                *,
+                active: bool,
+                completed: bool,
+            ) -> None:
+                if not session_id:
+                    return
+                with _lock:
+                    current = _sessions.get(session_id)
+                    if current is None:
+                        return
+                    current["register_delay_sec"] = delay
+                    current["register_delay_active"] = active
+                    current["register_delay_completed"] = completed
+                    current["register_delay_until"] = _now() + delay if active else None
+                    current["updated_at"] = _now()
+                    _mirror_reg_sess(session_id, current)
+
+            def _wait_after_attempt(session_id: str) -> None:
                 _wait_random_registration_delay(
                     delay_min,
                     delay_max,
                     cancel_requested=_batch_cancel_requested,
+                    on_start=lambda delay: _set_delay_state(
+                        session_id,
+                        delay,
+                        active=True,
+                        completed=False,
+                    ),
+                    on_finish=lambda delay, completed: _set_delay_state(
+                        session_id,
+                        delay,
+                        active=False,
+                        completed=completed,
+                    ),
                 )
+
+            def _finish_attempt(result: dict[str, Any]) -> dict[str, Any]:
+                _wait_after_attempt(str(result.get("id") or ""))
                 return result
 
             # Small per-slot stagger only (not cumulative across the whole batch).
@@ -1534,11 +1583,7 @@ def _spawn_batch_runner(
             try:
                 _run_registration(sid, key, proxy_val or "", receiver)
             except Exception:
-                _wait_random_registration_delay(
-                    delay_min,
-                    delay_max,
-                    cancel_requested=_batch_cancel_requested,
-                )
+                _wait_after_attempt(sid)
                 raise
             finally:
                 with _lock:
