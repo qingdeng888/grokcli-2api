@@ -25,6 +25,8 @@ window.G2A = window.G2A || {};
   let regFinishedNotified = false;
   let regStopping = false;
   let regPollInFlight = false;
+  let regRestoreInFlight = false;
+  let regLastRestoreAt = 0;
   let regLastLogText = "";
   let regLastStatusText = "";
   let regLastEmailText = "";
@@ -328,6 +330,7 @@ async function softNavigate(name, opts) {
     }
     if (page === "accounts") {
       try { await loadRegConfig(false); } catch (e) { console.warn("loadRegConfig", e); }
+      try { await restoreRegProgress(); } catch (e) { console.warn("restoreRegProgress", e); }
     }
     // Page-specific renders after content swap
     try {
@@ -407,9 +410,13 @@ function rebindPageControls() {
   // Soft-nav swaps DOM; re-show active registration card + keep polling if needed.
   try {
     const page = document.body.dataset.page || pageFromPath(location.pathname) || "";
-    if (page === "accounts" && (regBatchId || regSessionId || (regSessionIds && regSessionIds.length))) {
-      showPanel("reg-session-box");
-      if (!regFinishedNotified) startRegPolling({ immediate: true });
+    if (page === "accounts") {
+      if (regBatchId || regSessionId || (regSessionIds && regSessionIds.length)) {
+        showPanel("reg-session-box");
+        if (!regFinishedNotified) startRegPolling({ immediate: true });
+      } else {
+        restoreRegProgress().catch(() => {});
+      }
     }
   } catch (_) {}
 
@@ -676,17 +683,21 @@ function rebindPageControls() {
     on("reg-captcha-provider", "onchange", () => syncRegCaptchaProviderUI());
     syncRegCaptchaProviderUI();
   }
-  if ($("btn-refresh-reg")) on("btn-refresh-reg", "onclick", () => {
+  if ($("btn-refresh-reg")) on("btn-refresh-reg", "onclick", async () => {
     if (regBatchId || regSessionId || (regSessionIds && regSessionIds.length)) {
       showPanel("reg-session-box");
-      pollRegSession();
+      await pollRegSession();
     } else {
-      toast("当前没有进行中的注册", false);
+      const restored = await restoreRegProgress({ force: true });
+      if (!restored) toast("没有可恢复的注册日志", false);
     }
   });
   if ($("btn-stop-reg")) on("btn-stop-reg", "onclick", () => { stopRegistration().catch(() => {}); });
   if ($("btn-stop-reg-inline")) on("btn-stop-reg-inline", "onclick", () => { stopRegistration().catch(() => {}); });
-  if ($("btn-refresh-reg-inline")) on("btn-refresh-reg-inline", "onclick", () => pollRegSession());
+  if ($("btn-refresh-reg-inline")) on("btn-refresh-reg-inline", "onclick", async () => {
+    if (regBatchId || regSessionId || (regSessionIds && regSessionIds.length)) await pollRegSession();
+    else await restoreRegProgress({ force: true });
+  });
   if ($("btn-close-reg-inline")) on("btn-close-reg-inline", "onclick", () => {
     dismissRegProgressCard();
     toast("已关闭进度卡片（后台注册不受影响）");
@@ -2201,6 +2212,7 @@ pip install -r requirements.txt
 
 /* ── Email registration ─────────────────────────────── */
 const REG_CONFIG_KEY = "g2a_registration_config_v1";
+const REG_PROGRESS_RETENTION_SEC = 6 * 3600;
 
 function dismissRegProgressCard() {
   // Close only the UI card. Backend registration keeps running unless user hits stop.
@@ -2221,6 +2233,104 @@ function dismissRegProgressCard() {
   setLogPanel("reg-log", "", { forceShow: false });
   setRegStatusText("idle");
   setRegEmailText("—");
+}
+
+function regProgressTimestamp(item) {
+  const ts = Number((item && (item.updated_at || item.created_at)) || 0);
+  return Number.isFinite(ts) ? ts : 0;
+}
+
+function isRecentRegProgress(item) {
+  const ts = regProgressTimestamp(item);
+  return ts > 0 && Date.now() / 1000 - ts <= REG_PROGRESS_RETENTION_SEC;
+}
+
+function isActiveRegSession(session) {
+  const status = regStatusOf(session);
+  return !!(
+    session && session.register_delay_active
+  ) || (!REG_TERMINAL_OK.has(status) && !REG_TERMINAL_BAD.has(status));
+}
+
+function isActiveRegBatch(batch) {
+  const status = String((batch && (batch.batch_status || batch.status)) || "").toLowerCase();
+  if (
+    batch && (Number(batch.running) > 0 || Number(batch.delay_waiting) > 0)
+  ) return true;
+  return !!status && !["done", "partial", "error", "cancelled", "stopped"].includes(status);
+}
+
+async function restoreRegProgress({ force = false } = {}) {
+  const page = document.body.dataset.page || pageFromPath(location.pathname) || "";
+  if (page !== "accounts") return false;
+  if (regRestoreInFlight) return false;
+  if (!force && Date.now() - regLastRestoreAt < 1500) return false;
+  regRestoreInFlight = true;
+  regLastRestoreAt = Date.now();
+  try {
+    const data = await api("/accounts/register-email/sessions");
+    const sessions = Array.isArray(data && data.sessions) ? data.sessions.slice() : [];
+    const batches = Array.isArray(data && data.batches) ? data.batches.slice() : [];
+    sessions.sort((a, b) => regProgressTimestamp(b) - regProgressTimestamp(a));
+    batches.sort((a, b) => regProgressTimestamp(b) - regProgressTimestamp(a));
+
+    const batch = batches.find(isActiveRegBatch) || batches.find(isRecentRegProgress) || null;
+    if (batch) {
+      const batchId = String(batch.id || batch.batch_id || "").trim();
+      const ids = Array.isArray(batch.session_ids)
+        ? batch.session_ids.map(String).filter(Boolean)
+        : [];
+      const matched = sessions.filter((session) => {
+        const id = regSessionKey(session);
+        return (batchId && session.batch_id === batchId) || (id && ids.includes(id));
+      });
+      for (const session of matched) {
+        const id = regSessionKey(session);
+        if (id && !ids.includes(id)) ids.push(id);
+      }
+      regBatchId = batchId || null;
+      regSessionIds = ids;
+      regSessionId = ids[0] || null;
+      regStopping = String(batch.status || batch.batch_status || "").toLowerCase() === "stopping";
+      const active = isActiveRegBatch(batch) || matched.some(isActiveRegSession);
+      regFinishedNotified = !active;
+      regPollInFlight = false;
+      regLastLogText = "";
+      showPanel("reg-session-box");
+      showRegSessionGroup(matched, { batch });
+      if (active) startRegPolling({ immediate: true, intervalMs: 2000 });
+      else {
+        try { clearInterval(regPollTimer); } catch (_) {}
+        regPollTimer = null;
+      }
+      return true;
+    }
+
+    const latest = sessions.find(isActiveRegSession) || sessions.find(isRecentRegProgress) || null;
+    if (!latest) return false;
+    const batchId = String(latest.batch_id || "").trim();
+    const matched = batchId
+      ? sessions.filter((session) => session.batch_id === batchId)
+      : [latest];
+    regBatchId = batchId || null;
+    regSessionIds = matched.map(regSessionKey).filter(Boolean);
+    regSessionId = regSessionIds[0] || regSessionKey(latest) || null;
+    const active = matched.some(isActiveRegSession);
+    regFinishedNotified = !active;
+    regStopping = matched.some((session) => regStatusOf(session) === "stopping");
+    regPollInFlight = false;
+    regLastLogText = "";
+    showPanel("reg-session-box");
+    if (matched.length > 1 || regBatchId) showRegSessionGroup(matched);
+    else showRegSession(latest);
+    if (active) startRegPolling({ immediate: true, intervalMs: 2000 });
+    return true;
+  } catch (error) {
+    console.warn("restoreRegProgress", error);
+    return false;
+  } finally {
+    regRestoreInFlight = false;
+  }
 }
 
 function startRegPolling({ immediate = true, intervalMs = 2000 } = {}) {
@@ -3187,6 +3297,25 @@ function formatRegDelayState(s) {
     : `随机延时 ${Math.ceil(delay)} 秒已完成`;
 }
 
+function formatRegDelayLogLine(s, idx) {
+  const delayLabel = formatRegDelayState(s);
+  if (!delayLabel) return "";
+  const status = regStatusOf(s);
+  const result = REG_TERMINAL_OK.has(status)
+    ? "注册完成"
+    : REG_TERMINAL_BAD.has(status)
+      ? "注册失败"
+      : "注册结束";
+  const email = String((s && s.email) || "—");
+  if (s && s.register_delay_active) {
+    return `[倒计时] #${idx + 1} ${email} ${result}，${delayLabel}；倒计时结束后继续注册`;
+  }
+  if (s && s.register_delay_completed === false) {
+    return `[延时中断] #${idx + 1} ${email} ${result}，${delayLabel}`;
+  }
+  return `[延时完成] #${idx + 1} ${email} ${result}，${delayLabel}`;
+}
+
 function formatRegSessionLine(s, idx) {
   const st = regStatusOf(s) || "—";
   const email = (s && s.email) || "—";
@@ -3255,6 +3384,13 @@ function buildRegLogText(sessions, { batch = null, extraLines = [] } = {}) {
       (running ? ` · 进行中 ${running}` : "")
   );
   if (batch && batch.message) lines.push(`batch: ${batch.message}`);
+  const delayRows = (sessions || [])
+    .map((session, index) => formatRegDelayLogLine(session, index))
+    .filter(Boolean);
+  if (delayRows.length) {
+    lines.push("-------- 注册间隔倒计时 --------");
+    lines.push(...delayRows);
+  }
   lines.push("-------- 会话明细 --------");
   (sessions || []).forEach((s, i) => lines.push(formatRegSessionLine(s, i)));
   // Probe details from backend auto-probe
@@ -3519,7 +3655,10 @@ async function pollRegSession() {
         batchStatus === "error" ||
         batchStatus === "cancelled" ||
         batchStatus === "stopped" ||
-        (Number(batch.done) > 0 && Number(batch.done) >= Number(batch.total || batch.count || 0)));
+        (Number(batch.done) > 0 &&
+          Number(batch.done) >= Number(batch.total || batch.count || 0) &&
+          Number(batch.running || 0) <= 0 &&
+          Number(batch.delay_waiting || 0) <= 0));
     const batchStopping =
       !!regStopping ||
       batchStatus === "stopping" ||
@@ -3527,12 +3666,16 @@ async function pollRegSession() {
 
     const allTerminal =
       sessions.length > 0 &&
-      sessions.every((s) => REG_TERMINAL_OK.has(regStatusOf(s)) || REG_TERMINAL_BAD.has(regStatusOf(s)));
+      sessions.every(
+        (s) =>
+          !s.register_delay_active &&
+          (REG_TERMINAL_OK.has(regStatusOf(s)) || REG_TERMINAL_BAD.has(regStatusOf(s)))
+      );
     // Prefer batch-level completion: large batches may only keep a compact session window in UI.
     const finished =
       !!batchDone ||
       (allTerminal &&
-        (targetTotal <= 0 || sessions.length >= targetTotal || !regBatchId || batchStopping));
+        (!regBatchId || !batch || batchStopping));
 
     // Fallback client-side probe for imported accounts missing backend probe.
     // Skip while stopping — no need to thrash the card with new probe lines mid-stop.
@@ -5068,12 +5211,13 @@ if ($("btn-save-reg") && !$("btn-save-reg").onclick) {
   on("btn-save-reg", "onclick", () => { saveRegConfig().catch(() => {}); });
 }
 if ($("btn-refresh-reg") && !$("btn-refresh-reg").onclick) {
-  on("btn-refresh-reg", "onclick", () => {
+  on("btn-refresh-reg", "onclick", async () => {
     if (regBatchId || regSessionId || (regSessionIds && regSessionIds.length)) {
       showPanel("reg-session-box");
-      pollRegSession();
+      await pollRegSession();
     } else {
-      toast("当前没有进行中的注册", false);
+      const restored = await restoreRegProgress({ force: true });
+      if (!restored) toast("没有可恢复的注册日志", false);
     }
   });
 }
@@ -5084,7 +5228,10 @@ if ($("btn-stop-reg-inline") && !$("btn-stop-reg-inline").onclick) {
   on("btn-stop-reg-inline", "onclick", () => { stopRegistration().catch(() => {}); });
 }
 if ($("btn-refresh-reg-inline") && !$("btn-refresh-reg-inline").onclick) {
-  on("btn-refresh-reg-inline", "onclick", () => pollRegSession());
+  on("btn-refresh-reg-inline", "onclick", async () => {
+    if (regBatchId || regSessionId || (regSessionIds && regSessionIds.length)) await pollRegSession();
+    else await restoreRegProgress({ force: true });
+  });
 }
 if ($("btn-close-reg-inline") && !$("btn-close-reg-inline").onclick) {
   on("btn-close-reg-inline", "onclick", () => {

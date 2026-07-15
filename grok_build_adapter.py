@@ -30,7 +30,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 ROOT = Path(__file__).resolve().parent
 GBA = ROOT / "grok-build-auth"
-ADAPTER_BUILD = "2026-07-15-mail-rotation-delay-log-1"
+ADAPTER_BUILD = "2026-07-15-registration-log-persist-1"
 # Newly registered accounts often need a short settle window before probe.
 REGISTER_PROBE_DELAY_SEC = float(
     os.environ.get("GROK2API_REG_PROBE_DELAY_SEC", "30") or 30
@@ -2846,7 +2846,7 @@ def _batch_stats(
     session keys aged out. When no live sessions remain, fall back to the
     persisted batch status/message counters.
     """
-    imported = error = running = cancelled = missing = 0
+    imported = error = running = cancelled = missing = delay_waiting = 0
     for sid in session_ids:
         sess = _load_reg_sess(sid)
         if not sess:
@@ -2861,10 +2861,15 @@ def _batch_stats(
             error += 1
         else:
             running += 1
+        if sess.get("register_delay_active") and st in _TERMINAL_STATUSES:
+            delay_waiting += 1
 
     total = len(session_ids)
     observed = imported + error + cancelled + running
     done = imported + error + cancelled
+    # A terminal registration may still occupy its worker slot during the
+    # configured random delay. Keep the batch active until that wait finishes.
+    running += delay_waiting
     target = 0
     if isinstance(batch, dict):
         try:
@@ -2991,6 +2996,7 @@ def _batch_stats(
         "error": error,
         "cancelled": cancelled,
         "running": running,
+        "delay_waiting": delay_waiting,
         "missing": missing,
         "done": done,
         "batch_status": status,
